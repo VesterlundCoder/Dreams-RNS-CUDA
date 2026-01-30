@@ -74,8 +74,13 @@ def generate_rns_primes(K: int) -> np.ndarray:
 
 def compute_barrett_mu(primes: np.ndarray) -> np.ndarray:
     """Compute Barrett reduction constants."""
-    # Cast to Python int to avoid numpy uint32 overflow issues
-    return np.array([(1 << 63) // int(p) * 2 for p in primes], dtype=np.uint64)
+    # Use explicit uint64 array to avoid overflow
+    K = len(primes)
+    mus = np.zeros(K, dtype=np.uint64)
+    for i, p in enumerate(primes):
+        p_int = int(p)
+        mus[i] = ((1 << 63) // p_int) * 2
+    return mus
 
 
 class DreamsRunner:
