@@ -302,22 +302,185 @@ __device__ void init_identity_mod(u32* P, int m, u32 p) {
 }
 
 // ============================================================================
-// PERSISTENT KERNEL: Runs entire walk on GPU
+// SHADOW-FLOAT EVALUATION (mirrors RNS evaluation but uses double)
 // ============================================================================
 
+// Evaluate bytecode program in float mode (for shadow trajectory)
+__device__ void eval_program_float(
+    double* out,                    // Output: m*m entries
+    const DeviceProgram* prog,
+    const i32* shift,               // Shift for this batch element [dim]
+    int step_n                      // Current step
+) {
+    double regs[MAX_REGS];
+    int m = prog->m;
+    
+    // Initialize output to zero
+    for (int i = 0; i < m * m; i++) out[i] = 0.0;
+    
+    // Execute bytecode in float mode
+    for (int i = 0; i < prog->n_opcodes; i++) {
+        const Instr& instr = prog->opcodes[i];
+        switch (instr.op) {
+            case Opcode::NOP:
+                break;
+            case Opcode::LOAD_X: {
+                int axis = instr.arg0;
+                double val = (double)shift[axis] + (double)step_n * prog->directions[axis];
+                regs[instr.arg1] = val;
+                break;
+            }
+            case Opcode::LOAD_C: {
+                // Constants stored as integers, convert to float
+                regs[instr.arg1] = (double)prog->constants[instr.arg0];
+                break;
+            }
+            case Opcode::LOAD_N: {
+                regs[instr.arg0] = (double)step_n;
+                break;
+            }
+            case Opcode::ADD: {
+                regs[instr.arg2] = regs[instr.arg0] + regs[instr.arg1];
+                break;
+            }
+            case Opcode::SUB: {
+                regs[instr.arg2] = regs[instr.arg0] - regs[instr.arg1];
+                break;
+            }
+            case Opcode::MUL: {
+                regs[instr.arg2] = regs[instr.arg0] * regs[instr.arg1];
+                break;
+            }
+            case Opcode::NEG: {
+                regs[instr.arg1] = -regs[instr.arg0];
+                break;
+            }
+            case Opcode::POW2: {
+                double a = regs[instr.arg0];
+                regs[instr.arg1] = a * a;
+                break;
+            }
+            case Opcode::POW3: {
+                double a = regs[instr.arg0];
+                regs[instr.arg1] = a * a * a;
+                break;
+            }
+            case Opcode::INV: {
+                double a = regs[instr.arg0];
+                regs[instr.arg1] = (a != 0.0) ? (1.0 / a) : 0.0;
+                break;
+            }
+            case Opcode::STORE: {
+                int idx = instr.arg1 * m + instr.arg2;
+                out[idx] = regs[instr.arg0];
+                break;
+            }
+            case Opcode::END:
+                return;
+        }
+    }
+}
+
+// Float matrix multiply (for shadow trajectory)
+__device__ void matmul_float(double* C, const double* A, const double* B, int m) {
+    double tmp[MAX_M * MAX_M];
+    for (int i = 0; i < m; i++) {
+        for (int j = 0; j < m; j++) {
+            double acc = 0.0;
+            for (int k = 0; k < m; k++) {
+                acc += A[i * m + k] * B[k * m + j];
+            }
+            tmp[i * m + j] = acc;
+        }
+    }
+    for (int i = 0; i < m * m; i++) C[i] = tmp[i];
+}
+
+// Initialize identity matrix (float)
+__device__ void init_identity_float(double* P, int m) {
+    for (int i = 0; i < m * m; i++) P[i] = 0.0;
+    for (int i = 0; i < m; i++) P[i * m + i] = 1.0;
+}
+
+// Normalize float matrix and return max abs value
+__device__ double normalize_matrix(double* P, int m) {
+    double max_val = 0.0;
+    for (int i = 0; i < m * m; i++) {
+        double absv = fabs(P[i]);
+        if (absv > max_val) max_val = absv;
+    }
+    if (max_val > 1.0) {
+        for (int i = 0; i < m * m; i++) {
+            P[i] /= max_val;
+        }
+    }
+    return max_val;
+}
+
+// ============================================================================
+// DREAMS DELTA COMPUTATION (shadow-float based)
+// ============================================================================
+// delta = -(1 + log(|err|) / log(|q|))
+// where err = |est - target|, est = p/q from trajectory matrix
+
+__device__ double compute_dreams_delta(
+    const double* P_float,          // Trajectory matrix [m*m]
+    double log_scale,               // Accumulated log scale
+    int m,
+    double target,
+    double* out_log_q               // Output: log|q|
+) {
+    // Extract p and q from trajectory (convention: p = P[0, m-1], q = P[1, m-1])
+    double p_val = P_float[0 * m + (m - 1)];
+    double q_val = P_float[1 * m + (m - 1)];
+    
+    // Guard against invalid values
+    if (!isfinite(p_val) || !isfinite(q_val) || fabs(q_val) < 1e-300) {
+        *out_log_q = 0.0;
+        return -1e10;  // Invalid, will be filtered
+    }
+    
+    // Compute estimate
+    double est = p_val / q_val;
+    double abs_err = fabs(est - target);
+    
+    // Compute log|q| including accumulated scale
+    double log_abs_q = log_scale + log(fabs(q_val));
+    *out_log_q = log_abs_q;
+    
+    // Guard against edge cases
+    if (abs_err < 1e-300 || log_abs_q <= 0.0) {
+        return (abs_err < 1e-300) ? 100.0 : -1e10;  // Perfect match or invalid
+    }
+    
+    // Dreams delta formula
+    double delta = -(1.0 + log(abs_err) / log_abs_q);
+    
+    return delta;
+}
+
+// ============================================================================
+// PERSISTENT KERNEL: Runs entire walk on GPU with shadow-float
+// ============================================================================
+// Key insight: RNS trajectory is per-(k,b), but shadow-float is per-b only.
+// Only k==0 threads update the shadow-float trajectory.
+
+#define NORMALIZE_EVERY 50  // Normalize shadow-float every N steps
+
 __global__ void k_persistent_walk(
-    u32* P_rns,                     // Trajectory: [K, B, m*m]
+    u32* P_rns,                     // RNS trajectory: [K, B, m*m]
     double* P_float,                // Shadow trajectory: [B, m*m]
     double* log_scale,              // Log scale: [B]
-    double* deltas,                 // Output deltas: [B]
-    double* log_qs,                 // Output log_q: [B]
+    double* deltas,                 // Output Dreams delta: [B]
+    double* log_qs,                 // Output log|q|: [B]
     const i32* shifts,              // Shifts: [B, dim]
     int K, int B, int m, int dim,
     int depth,
     double target,
-    int snapshot_depth
+    int snapshot_depth_lo,          // First snapshot (e.g., 200)
+    int snapshot_depth_hi           // Second snapshot (e.g., 2000)
 ) {
-    // Thread indexing: we parallelize over (k, b) pairs
+    // Thread indexing: parallelize over (k, b) pairs
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int k = tid / B;                // Prime index
     int b = tid % B;                // Batch index
@@ -327,9 +490,14 @@ __global__ void k_persistent_walk(
     u32 p = d_primes[k].p;
     u64 mu = d_primes[k].mu;
     
-    // Local storage for this thread
+    // Local storage for RNS
     u32 P_local[MAX_M * MAX_M];
     u32 M_local[MAX_M * MAX_M];
+    
+    // Local storage for shadow-float (only used by k==0)
+    double P_float_local[MAX_M * MAX_M];
+    double M_float_local[MAX_M * MAX_M];
+    double local_log_scale = 0.0;
     
     // Get shift for this batch element
     i32 shift_local[MAX_AXES];
@@ -337,15 +505,21 @@ __global__ void k_persistent_walk(
         shift_local[d] = shifts[b * dim + d];
     }
     
-    // Initialize P to identity
+    // Initialize P to identity (RNS)
     init_identity_mod(P_local, m, p);
+    
+    // Initialize shadow-float (only k==0)
+    if (k == 0) {
+        init_identity_float(P_float_local, m);
+    }
     
     // Main walk loop
     for (int step = 0; step < depth; step++) {
-        // Evaluate step matrix M for this step
+        // ===== RNS PATH (all k threads) =====
+        // Evaluate step matrix M in RNS
         eval_program_single(M_local, &d_program, shift_local, step, k, p, mu);
         
-        // Update trajectory: P = P @ M (dispatch to specialized kernel by m)
+        // Update RNS trajectory: P = P @ M
         switch (m) {
             case 2:
                 matmul_2x2_mod(P_local, P_local, M_local, p, mu);
@@ -364,17 +538,49 @@ __global__ void k_persistent_walk(
                 break;
         }
         
-        // At snapshot depth, compute delta (only prime 0 does this to avoid races)
-        if (step + 1 == snapshot_depth && k == 0) {
-            // This is just placeholder - real delta computation needs all primes
-            // We'll do proper delta computation in a separate kernel call
+        // ===== SHADOW-FLOAT PATH (only k==0) =====
+        if (k == 0) {
+            // Evaluate step matrix M in float
+            eval_program_float(M_float_local, &d_program, shift_local, step);
+            
+            // Update shadow trajectory: P_float = P_float @ M_float
+            matmul_float(P_float_local, P_float_local, M_float_local, m);
+            
+            // Normalize periodically to prevent overflow
+            if ((step + 1) % NORMALIZE_EVERY == 0) {
+                double scale = normalize_matrix(P_float_local, m);
+                if (scale > 1.0) {
+                    local_log_scale += log(scale);
+                }
+            }
+            
+            // Compute Dreams delta at snapshot depths
+            if (step + 1 == snapshot_depth_lo || step + 1 == snapshot_depth_hi) {
+                double log_q;
+                double delta = compute_dreams_delta(P_float_local, local_log_scale, 
+                                                    m, target, &log_q);
+                
+                // Store (only at final snapshot or if this is better)
+                if (step + 1 == snapshot_depth_hi) {
+                    deltas[b] = delta;
+                    log_qs[b] = log_q;
+                }
+            }
         }
     }
     
-    // Write final P back to global memory
+    // Write final RNS P back to global memory (for optional CRT verification)
     int mm = m * m;
     for (int i = 0; i < mm; i++) {
         P_rns[k * B * mm + b * mm + i] = P_local[i];
+    }
+    
+    // Write final shadow-float state (only k==0)
+    if (k == 0) {
+        for (int i = 0; i < mm; i++) {
+            P_float[b * mm + i] = P_float_local[i];
+        }
+        log_scale[b] = local_log_scale;
     }
 }
 
@@ -585,7 +791,8 @@ __global__ void k_compute_delta_proxy(
     log_qs[b] = log_abs_q;
 }
 
-// TopK selection kernel
+// TopK selection kernel - selects by HIGHEST delta (Dreams convention)
+// In Dreams, delta > 0 indicates good convergence, higher is better
 __global__ void k_topk_select(
     Hit* hits,
     int* hit_count,
@@ -596,8 +803,8 @@ __global__ void k_topk_select(
     int depth,
     int dim,
     int B,
-    int topk,
-    double threshold
+    int max_hits,
+    double min_delta                // Minimum delta threshold (e.g., 0.0 or -0.5)
 ) {
     __shared__ Hit shared_hits[256];
     __shared__ int shared_count;
@@ -607,7 +814,9 @@ __global__ void k_topk_select(
     
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     
-    if (b < B && deltas[b] < threshold) {
+    // Dreams: select hits where delta > min_delta (higher delta = better)
+    // Also filter out invalid deltas (< -1e9)
+    if (b < B && deltas[b] > min_delta && deltas[b] > -1e9) {
         int idx = atomicAdd(&shared_count, 1);
         if (idx < 256) {
             shared_hits[idx].cmf_idx = cmf_idx;
@@ -621,10 +830,11 @@ __global__ void k_topk_select(
     }
     __syncthreads();
     
-    // Thread 0 writes to global hits (simple approach, could be improved)
+    // Thread 0 writes to global hits
     if (threadIdx.x == 0 && shared_count > 0) {
-        int global_idx = atomicAdd(hit_count, min(shared_count, topk));
-        for (int i = 0; i < min(shared_count, topk) && global_idx + i < topk; i++) {
+        int to_write = min(shared_count, 256);
+        int global_idx = atomicAdd(hit_count, to_write);
+        for (int i = 0; i < to_write && global_idx + i < max_hits; i++) {
             hits[global_idx + i] = shared_hits[i];
         }
     }
@@ -655,10 +865,15 @@ void run_walk_loop(
     cudaMalloc(&d_deltas, config.B * sizeof(double));
     cudaMalloc(&d_log_qs, config.B * sizeof(double));
     
+    // Initialize deltas to invalid (will be set by persistent kernel)
+    cudaMemset(d_deltas, 0, config.B * sizeof(double));
+    cudaMemset(d_log_qs, 0, config.B * sizeof(double));
+    
     // Initialize hit count
     cudaMemset(d_num_hits, 0, sizeof(int));
     
-    // Launch persistent kernel
+    // Launch persistent kernel with shadow-float Dreams delta
+    // This computes delta directly in the kernel using shadow-float trajectory
     int total_threads = config.K * config.B;
     int blocks = (total_threads + BLOCK_SIZE - 1) / BLOCK_SIZE;
     
@@ -668,20 +883,13 @@ void run_walk_loop(
         config.K, config.B, config.m, config.dim,
         config.depth,
         config.target,
-        config.snapshot_depths[1]
+        config.snapshot_depths[0],  // snapshot_depth_lo (e.g., 200)
+        config.snapshot_depths[1]   // snapshot_depth_hi (e.g., 2000)
     );
     
-    // Compute delta proxy
+    // TopK selection - select hits with delta > delta_threshold
+    // In Dreams, higher delta = better convergence
     int blocks_b = (config.B + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    k_compute_delta_proxy<<<blocks_b, BLOCK_SIZE>>>(
-        d_deltas, d_log_qs, P_rns,
-        config.K, config.B, config.m,
-        config.target,
-        0, -1, 1, -1,               // p_row, p_col, q_row, q_col
-        8                           // K_small
-    );
-    
-    // TopK selection
     k_topk_select<<<blocks_b, BLOCK_SIZE>>>(
         d_hits, d_num_hits,
         d_deltas, d_log_qs, shifts,
@@ -690,7 +898,7 @@ void run_walk_loop(
         config.dim,
         config.B,
         config.topk,
-        1e-6                        // threshold
+        config.delta_threshold      // min_delta threshold (Dreams: higher = better)
     );
     
     cudaFree(d_deltas);

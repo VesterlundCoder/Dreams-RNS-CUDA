@@ -15,17 +15,21 @@ from .compiler import CmfProgram, Opcode
 
 @dataclass
 class WalkConfig:
-    """Configuration for walk execution."""
+    """Configuration for walk execution.
+    
+    Dreams delta = -(1 + log(|err|) / log(|q|))
+    where err = |p/q - target|.
+    
+    Higher delta = better convergence. Hits are selected where delta > delta_threshold.
+    """
     K: int = 64                     # Number of primes (64 * 31 = 1984 bits)
-    K_small: int = 8                # Primes for partial CRT scoring (8 * 31 = 248 bits)
     B: int = 1000                   # Batch size (shifts per CMF)
     depth: int = 2000               # Walk depth
     topk: int = 100                 # Top-K hits to keep
     target: float = math.pi         # Target constant
     snapshot_depths: Tuple[int, int] = (200, 2000)
-    delta_threshold: float = 1e-6   # Hit threshold
-    use_float_shadow: bool = False  # Optional float64 shadow (for debugging only)
-    use_crt_scoring: bool = True    # Use partial CRT for delta scoring (default)
+    delta_threshold: float = 0.0    # Minimum delta for hits (Dreams: higher = better)
+    normalize_every: int = 50       # Normalize shadow-float every N steps
 
 
 @dataclass
@@ -125,32 +129,44 @@ def crt_reconstruct_partial(residues: np.ndarray, primes: np.ndarray) -> int:
     return x
 
 
-def compute_delta_from_crt(p_residues: np.ndarray, q_residues: np.ndarray,
-                           primes: np.ndarray, target: float) -> Tuple[float, float]:
+def compute_dreams_delta(p_val: float, q_val: float, log_scale: float, 
+                         target: float) -> Tuple[float, float]:
     """
-    Compute delta and log_q from RNS residues using partial CRT.
+    Compute Dreams delta from trajectory values.
+    
+    Dreams delta = -(1 + log(|err|) / log(|q|))
+    where err = |p/q - target|
+    
+    Higher delta = better convergence (closer to Diophantine limit).
     
     Args:
-        p_residues: p value residues [K_small]
-        q_residues: q value residues [K_small]
-        primes: primes used [K_small]
+        p_val: numerator from trajectory P[0, m-1]
+        q_val: denominator from trajectory P[1, m-1]
+        log_scale: accumulated log of normalization scale
         target: target constant
     
     Returns:
         (delta, log_q) tuple
     """
-    p_val = crt_reconstruct_partial(p_residues, primes)
-    q_val = crt_reconstruct_partial(q_residues, primes)
+    # Guard against invalid values
+    if not math.isfinite(p_val) or not math.isfinite(q_val) or abs(q_val) < 1e-300:
+        return -1e10, 0.0
     
-    if q_val == 0:
-        return 1e10, 0.0
+    # Compute estimate and error
+    est = p_val / q_val
+    abs_err = abs(est - target)
     
-    # Use high-precision division
-    ratio = p_val / q_val
-    delta = abs(ratio - target)
-    log_q = math.log(abs(q_val)) if q_val != 0 else 0.0
+    # Compute log|q| including accumulated scale
+    log_abs_q = log_scale + math.log(abs(q_val))
     
-    return delta, log_q
+    # Guard against edge cases
+    if abs_err < 1e-300 or log_abs_q <= 0.0:
+        return (100.0 if abs_err < 1e-300 else -1e10), log_abs_q
+    
+    # Dreams delta formula
+    delta = -(1.0 + math.log(abs_err) / log_abs_q)
+    
+    return delta, log_abs_q
 
 
 class DreamsRunner:
@@ -304,25 +320,27 @@ class DreamsRunner:
                     log_scale[b] += np.log(max_val)
                 P_float[b] = new_P_float
             
-            # Check for hits at snapshot depth
+            # Check for hits at snapshot depth using Dreams delta
             if step + 1 in self.config.snapshot_depths:
                 for b in range(B):
                     # Extract p, q from trajectory
-                    p_val = P_float[b, 0, -1]
-                    q_val = P_float[b, 1, -1]
+                    p_val = float(P_float[b, 0, -1])
+                    q_val = float(P_float[b, 1, -1])
                     
-                    if abs(q_val) > 1e-10:
-                        ratio = p_val / q_val
-                        delta = abs(ratio - self.target)
-                        
-                        if delta < self.config.delta_threshold:
-                            hits.append(Hit(
-                                cmf_idx=0,
-                                shift=list(shifts[b]),
-                                depth=step + 1,
-                                delta=delta,
-                                log_q=log_scale[b] + np.log(abs(q_val))
-                            ))
+                    # Compute Dreams delta
+                    delta, log_q = compute_dreams_delta(
+                        p_val, q_val, float(log_scale[b]), self.target
+                    )
+                    
+                    # Dreams: select hits where delta > threshold (higher = better)
+                    if delta > self.config.delta_threshold and delta > -1e9:
+                        hits.append(Hit(
+                            cmf_idx=0,
+                            shift=list(shifts[b]),
+                            depth=step + 1,
+                            delta=delta,
+                            log_q=log_q
+                        ))
         
         return hits
     
@@ -399,53 +417,28 @@ class DreamsRunner:
                     log_scale[b_start:b_end] += cp.log(scale_factors)
                 P_float[b_start:b_end] = batch
             
-            # Check for hits at snapshot depths
+            # Check for hits at snapshot depths using Dreams delta (shadow-float)
             if step + 1 in self.config.snapshot_depths:
-                if self.config.use_crt_scoring:
-                    # CRT-based scoring (PRIMARY method)
-                    K_small = min(self.config.K_small, K)
+                # Extract p and q from shadow-float trajectory
+                p_vals = P_float[:, 0, -1].get()  # [B]
+                q_vals = P_float[:, 1, -1].get()  # [B]
+                log_scales = log_scale.get()      # [B]
+                
+                # Compute Dreams delta for each shift
+                for b in range(B):
+                    delta, log_q = compute_dreams_delta(
+                        float(p_vals[b]), float(q_vals[b]), 
+                        float(log_scales[b]), self.target
+                    )
                     
-                    # Extract p and q residues for first K_small primes
-                    p_residues = P_rns[:K_small, :, 0, -1].get()  # [K_small, B]
-                    q_residues = P_rns[:K_small, :, 1, -1].get()  # [K_small, B]
-                    primes_small = self._primes[:K_small]
-                    
-                    # Compute delta for each shift using CRT
-                    for b in range(B):
-                        p_res = p_residues[:, b]
-                        q_res = q_residues[:, b]
-                        
-                        delta, log_q = compute_delta_from_crt(
-                            p_res, q_res, primes_small, self.target
-                        )
-                        
-                        if delta < self.config.delta_threshold:
-                            hits.append(Hit(
-                                cmf_idx=cmf_idx,
-                                shift=list(shifts[b]),
-                                depth=step + 1,
-                                delta=delta,
-                                log_q=log_q
-                            ))
-                else:
-                    # Float shadow scoring (optional, for debugging)
-                    p_vals = P_float[:, 0, -1]
-                    q_vals = P_float[:, 1, -1]
-                    
-                    valid = cp.abs(q_vals) > 1e-10
-                    ratios = cp.where(valid, p_vals / q_vals, 0.0)
-                    deltas = cp.abs(ratios - self.target)
-                    
-                    hit_mask = (deltas < self.config.delta_threshold) & valid
-                    hit_indices = cp.where(hit_mask)[0]
-                    
-                    for idx in hit_indices.get():
+                    # Dreams: select hits where delta > threshold (higher = better)
+                    if delta > self.config.delta_threshold and delta > -1e9:
                         hits.append(Hit(
                             cmf_idx=cmf_idx,
-                            shift=list(shifts[idx]),
+                            shift=list(shifts[b]),
                             depth=step + 1,
-                            delta=float(deltas[idx].get()),
-                            log_q=float(log_scale[idx].get() + cp.log(cp.abs(q_vals[idx])).get())
+                            delta=delta,
+                            log_q=log_q
                         ))
         
         return hits
@@ -496,8 +489,8 @@ class DreamsRunner:
             all_hits.extend(hits)
             print(f"  Found {len(hits)} hits")
         
-        # Sort by delta and keep top-k
-        all_hits.sort(key=lambda h: h.delta)
+        # Sort by delta (highest first - Dreams: higher delta = better)
+        all_hits.sort(key=lambda h: h.delta, reverse=True)
         return all_hits[:self.config.topk]
     
     def run_single(self, program: CmfProgram, shifts: np.ndarray,
