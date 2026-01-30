@@ -15,38 +15,48 @@ namespace dreams {
 __constant__ DeviceProgram d_program;
 __constant__ PrimeMeta d_primes[MAX_K];
 
+// ============================================================================
+// MODULAR ARITHMETIC PRIMITIVES (SAFE IMPLEMENTATIONS)
+// ============================================================================
+
 // Barrett reduction: compute a mod p using precomputed mu
+// INVARIANT: a < p * 2^32 (satisfied when a is product of two u32 residues)
 __device__ __forceinline__ u32 barrett_reduce(u64 a, u32 p, u64 mu) {
     u64 q = __umul64hi(a, mu);
     u64 r = a - q * p;
     return (r >= p) ? (u32)(r - p) : (u32)r;
 }
 
-// Modular addition
+// Modular addition: (a + b) mod p where a, b < p
 __device__ __forceinline__ u32 mod_add(u32 a, u32 b, u32 p) {
-    u32 r = a + b;
-    return (r >= p) ? r - p : r;
+    u64 sum = (u64)a + (u64)b;  // Safe: max 2^32 - 2
+    return (sum >= p) ? (u32)(sum - p) : (u32)sum;
 }
 
-// Modular subtraction
+// Modular subtraction: (a - b) mod p where a, b < p
 __device__ __forceinline__ u32 mod_sub(u32 a, u32 b, u32 p) {
-    return (a >= b) ? a - b : p - b + a;
+    return (a >= b) ? (a - b) : (p - b + a);
 }
 
-// Modular multiplication with Barrett
+// Modular multiplication with Barrett: (a * b) mod p
 __device__ __forceinline__ u32 mod_mul(u32 a, u32 b, u32 p, u64 mu) {
-    return barrett_reduce((u64)a * b, p, mu);
+    return barrett_reduce((u64)a * (u64)b, p, mu);
 }
 
-// Modular negation
+// Modular negation: (-a) mod p
 __device__ __forceinline__ u32 mod_neg(u32 a, u32 p) {
     return (a == 0) ? 0 : p - a;
 }
 
 // Extended GCD for modular inverse
-__device__ u32 mod_inv(u32 a, u32 p) {
+// Returns 0 if a == 0 (caller should mark lane as dead)
+__device__ u32 mod_inv(u32 a, u32 p, bool* alive) {
+    if (a == 0) {
+        *alive = false;
+        return 0;
+    }
     i32 t = 0, newt = 1;
-    i32 r = p, newr = a;
+    i32 r = (i32)p, newr = (i32)a;
     while (newr != 0) {
         i32 quotient = r / newr;
         i32 tmp = t - quotient * newt;
@@ -54,7 +64,13 @@ __device__ u32 mod_inv(u32 a, u32 p) {
         tmp = r - quotient * newr;
         r = newr; newr = tmp;
     }
-    return (t < 0) ? (u32)(t + p) : (u32)t;
+    return (t < 0) ? (u32)(t + (i32)p) : (u32)t;
+}
+
+// Overload without alive tracking (for compatibility)
+__device__ u32 mod_inv(u32 a, u32 p) {
+    bool dummy = true;
+    return mod_inv(a, p, &dummy);
 }
 
 // Evaluate bytecode program for one (prime, shift) pair
@@ -139,11 +155,46 @@ __device__ void eval_program_single(
     }
 }
 
-// 4x4 modular matrix multiply (optimized for small m)
+// ============================================================================
+// SAFE MODULAR MATRIX MULTIPLY
+// ============================================================================
+// CRITICAL: For m > 4, we MUST reduce after each multiply-add to prevent
+// u64 overflow. For m <= 4, we can accumulate then reduce once at the end.
+// Worst case without reduction: m * (p-1)^2 ≈ m * 2^62
+// For m=4: 4 * 2^62 = 2^64 (just barely safe)
+// For m=6: 6 * 2^62 > 2^64 (OVERFLOW - must reduce per iteration)
+// ============================================================================
+
+// 2x2 modular matrix multiply (m=2, safe: 2 * 2^62 < 2^64)
+__device__ void matmul_2x2_mod(
+    u32* C,
+    const u32* A,
+    const u32* B,
+    u32 p,
+    u64 mu
+) {
+    u32 tmp[4];
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        #pragma unroll
+        for (int j = 0; j < 2; j++) {
+            u64 acc = 0;
+            #pragma unroll
+            for (int k = 0; k < 2; k++) {
+                acc += (u64)A[i * 2 + k] * (u64)B[k * 2 + j];
+            }
+            tmp[i * 2 + j] = barrett_reduce(acc, p, mu);
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++) C[i] = tmp[i];
+}
+
+// 4x4 modular matrix multiply (m=4, safe: 4 * 2^62 = 2^64)
 __device__ void matmul_4x4_mod(
-    u32* C,                         // Output: 16 entries
-    const u32* A,                   // Input: 16 entries
-    const u32* B,                   // Input: 16 entries
+    u32* C,
+    const u32* A,
+    const u32* B,
     u32 p,
     u64 mu
 ) {
@@ -155,7 +206,7 @@ __device__ void matmul_4x4_mod(
             u64 acc = 0;
             #pragma unroll
             for (int k = 0; k < 4; k++) {
-                acc += (u64)A[i * 4 + k] * B[k * 4 + j];
+                acc += (u64)A[i * 4 + k] * (u64)B[k * 4 + j];
             }
             tmp[i * 4 + j] = barrett_reduce(acc, p, mu);
         }
@@ -164,7 +215,62 @@ __device__ void matmul_4x4_mod(
     for (int i = 0; i < 16; i++) C[i] = tmp[i];
 }
 
-// General m x m modular matrix multiply
+// 6x6 modular matrix multiply (m=6, UNSAFE without per-step reduction)
+// Must reduce after each multiply-add
+__device__ void matmul_6x6_mod(
+    u32* C,
+    const u32* A,
+    const u32* B,
+    u32 p,
+    u64 mu
+) {
+    u32 tmp[36];
+    #pragma unroll
+    for (int i = 0; i < 6; i++) {
+        #pragma unroll
+        for (int j = 0; j < 6; j++) {
+            u64 acc = 0;
+            #pragma unroll
+            for (int k = 0; k < 6; k++) {
+                // Reduce product before accumulating to prevent overflow
+                u32 prod = mod_mul(A[i * 6 + k], B[k * 6 + j], p, mu);
+                acc += prod;
+            }
+            // acc <= 6 * (p-1) < 6 * 2^31 < 2^34, safe for final reduction
+            tmp[i * 6 + j] = (u32)(acc % p);
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 36; i++) C[i] = tmp[i];
+}
+
+// 8x8 modular matrix multiply (m=8, UNSAFE without per-step reduction)
+__device__ void matmul_8x8_mod(
+    u32* C,
+    const u32* A,
+    const u32* B,
+    u32 p,
+    u64 mu
+) {
+    u32 tmp[64];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            u64 acc = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                u32 prod = mod_mul(A[i * 8 + k], B[k * 8 + j], p, mu);
+                acc += prod;
+            }
+            tmp[i * 8 + j] = (u32)(acc % p);
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 64; i++) C[i] = tmp[i];
+}
+
+// General m x m modular matrix multiply (safe for any m)
 __device__ void matmul_mod(
     u32* C,
     const u32* A,
@@ -178,9 +284,12 @@ __device__ void matmul_mod(
         for (int j = 0; j < m; j++) {
             u64 acc = 0;
             for (int k = 0; k < m; k++) {
-                acc += (u64)A[i * m + k] * B[k * m + j];
+                // Always reduce per-step for safety in general case
+                u32 prod = mod_mul(A[i * m + k], B[k * m + j], p, mu);
+                acc += prod;
             }
-            tmp[i * m + j] = barrett_reduce(acc, p, mu);
+            // acc <= m * (p-1) < m * 2^31, safe to reduce
+            tmp[i * m + j] = (u32)(acc % p);
         }
     }
     for (int i = 0; i < m * m; i++) C[i] = tmp[i];
@@ -236,11 +345,23 @@ __global__ void k_persistent_walk(
         // Evaluate step matrix M for this step
         eval_program_single(M_local, &d_program, shift_local, step, k, p, mu);
         
-        // Update trajectory: P = P @ M
-        if (m == 4) {
-            matmul_4x4_mod(P_local, P_local, M_local, p, mu);
-        } else {
-            matmul_mod(P_local, P_local, M_local, m, p, mu);
+        // Update trajectory: P = P @ M (dispatch to specialized kernel by m)
+        switch (m) {
+            case 2:
+                matmul_2x2_mod(P_local, P_local, M_local, p, mu);
+                break;
+            case 4:
+                matmul_4x4_mod(P_local, P_local, M_local, p, mu);
+                break;
+            case 6:
+                matmul_6x6_mod(P_local, P_local, M_local, p, mu);
+                break;
+            case 8:
+                matmul_8x8_mod(P_local, P_local, M_local, p, mu);
+                break;
+            default:
+                matmul_mod(P_local, P_local, M_local, m, p, mu);
+                break;
         }
         
         // At snapshot depth, compute delta (only prime 0 does this to avoid races)
@@ -257,7 +378,144 @@ __global__ void k_persistent_walk(
     }
 }
 
-// Kernel to compute delta proxy using partial CRT
+// ============================================================================
+// GPU PARTIAL CRT RECONSTRUCTION (256-bit)
+// ============================================================================
+// Reconstructs integer from residues using iterative CRT (Chinese Remainder Theorem)
+// Result is stored in U256 (4 x u64 limbs)
+
+// Precomputed constants for 256-bit mod p operations
+struct CrtConstants {
+    u64 R1;  // 2^64 mod p
+    u64 R2;  // 2^128 mod p
+    u64 R3;  // 2^192 mod p
+};
+
+// Compute x mod p where x is a 256-bit integer (4 limbs)
+__device__ __forceinline__ u32 u256_mod_p(const U256& x, u32 p, const CrtConstants& c) {
+    // x mod p = (x0 + R1*x1 + R2*x2 + R3*x3) mod p
+    u64 acc = x.limbs[0] % p;
+    acc += (c.R1 * (x.limbs[1] % p)) % p;
+    acc += (c.R2 * (x.limbs[2] % p)) % p;
+    acc += (c.R3 * (x.limbs[3] % p)) % p;
+    return (u32)(acc % p);
+}
+
+// Add U256 + u64 * u64 (x = x + M * t where M and t are both < 2^64 for simplicity)
+// For full 256-bit M, we need multi-precision arithmetic
+__device__ void u256_add_mul(U256& x, const U256& M, u64 t) {
+    // Compute M * t (256-bit * 64-bit = 320-bit, but we'll truncate to 256)
+    // For simplicity with K_small <= 8, M stays within 256 bits
+    
+    // Multiply M by t and add to x
+    u64 carry = 0;
+    for (int i = 0; i < 4; i++) {
+        // Compute M.limbs[i] * t + carry + x.limbs[i]
+        // This needs 128-bit intermediate
+        u64 lo = M.limbs[i] * t;  // Low 64 bits of product
+        u64 hi = __umul64hi(M.limbs[i], t);  // High 64 bits
+        
+        // Add to x with carry propagation
+        u64 sum = x.limbs[i] + lo + carry;
+        carry = hi + (sum < x.limbs[i] ? 1 : 0) + (sum < lo ? 1 : 0);
+        x.limbs[i] = sum;
+    }
+}
+
+// Multiply U256 by u32 (for updating M = M * p)
+__device__ void u256_mul_u32(U256& M, u32 p) {
+    u64 carry = 0;
+    u64 p64 = (u64)p;
+    for (int i = 0; i < 4; i++) {
+        // M.limbs[i] * p + carry
+        // u64 * u32 = 96 bits max, plus carry (32 bits) = 97 bits
+        // We need to handle this carefully
+        u64 lo = M.limbs[i] * p64;
+        u64 hi = __umul64hi(M.limbs[i], p64);
+        
+        // Add carry to lo, propagate to hi if overflow
+        u64 sum = lo + carry;
+        if (sum < lo) hi++;
+        
+        M.limbs[i] = sum;
+        carry = hi;
+    }
+}
+
+// Simplified iterative CRT for K_small primes
+// x = CRT(residues[0..K_small-1], primes[0..K_small-1])
+__device__ void crt_reconstruct_partial(
+    U256& result,
+    const u32* residues,    // K_small residues
+    int K_small
+) {
+    // Start with x = residues[0], M = primes[0]
+    result = U256(residues[0]);
+    U256 M;
+    M.limbs[0] = d_primes[0].p;
+    
+    for (int i = 1; i < K_small; i++) {
+        u32 p_i = d_primes[i].p;
+        u32 a_i = residues[i];
+        
+        // Compute x mod p_i
+        CrtConstants c;
+        c.R1 = ((u64)1 << 32) % p_i;
+        c.R1 = (c.R1 * c.R1) % p_i;  // 2^64 mod p_i
+        c.R2 = (c.R1 * c.R1) % p_i;  // 2^128 mod p_i
+        c.R3 = (c.R2 * c.R1) % p_i;  // 2^192 mod p_i
+        
+        u32 x_mod_pi = u256_mod_p(result, p_i, c);
+        
+        // Compute M mod p_i
+        u32 M_mod_pi = u256_mod_p(M, p_i, c);
+        
+        // Compute t = (a_i - x_mod_pi) * inv(M_mod_pi) mod p_i
+        u32 diff = (a_i >= x_mod_pi) ? (a_i - x_mod_pi) : (p_i - x_mod_pi + a_i);
+        u32 M_inv = mod_inv(M_mod_pi, p_i);
+        u32 t = mod_mul(diff, M_inv, p_i, d_primes[i].mu);
+        
+        // Update x = x + M * t
+        u256_add_mul(result, M, t);
+        
+        // Update M = M * p_i
+        u256_mul_u32(M, p_i);
+    }
+}
+
+// Convert U256 to double (approximate, for delta computation)
+__device__ double u256_to_double(const U256& x) {
+    // Find highest non-zero limb
+    int top_idx = 3;
+    while (top_idx > 0 && x.limbs[top_idx] == 0) top_idx--;
+    
+    if (top_idx == 0 && x.limbs[0] == 0) return 0.0;
+    
+    // Convert with appropriate scaling
+    double result = (double)x.limbs[top_idx];
+    result = ldexp(result, 64 * top_idx);
+    
+    // Add contribution from lower limbs for better precision
+    if (top_idx > 0) {
+        result += ldexp((double)x.limbs[top_idx - 1], 64 * (top_idx - 1));
+    }
+    
+    return result;
+}
+
+// Compute bit length of U256 (for log|q| estimation)
+__device__ int u256_bitlen(const U256& x) {
+    int top_idx = 3;
+    while (top_idx > 0 && x.limbs[top_idx] == 0) top_idx--;
+    
+    if (x.limbs[top_idx] == 0) return 0;
+    
+    // Count leading zeros in top limb
+    int lz = __clzll(x.limbs[top_idx]);
+    return 64 * (top_idx + 1) - lz;
+}
+
+// Kernel to compute delta proxy using proper partial CRT
 __global__ void k_compute_delta_proxy(
     double* deltas,
     double* log_qs,
@@ -266,43 +524,65 @@ __global__ void k_compute_delta_proxy(
     double target,
     int p_row, int p_col,
     int q_row, int q_col,
-    int K_small                     // Number of primes for rough CRT
+    int K_small                     // Number of primes for CRT
 ) {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= B) return;
     
-    // Extract p and q entries from P matrix
+    // Clamp K_small
+    if (K_small > K) K_small = K;
+    if (K_small > MAX_K_SMALL) K_small = MAX_K_SMALL;
+    
+    // Extract p and q residues from P matrix
     int mm = m * m;
     int p_idx = p_row * m + ((p_col < 0) ? m - 1 : p_col);
     int q_idx = q_row * m + ((q_col < 0) ? m - 1 : q_col);
     
-    // Rough CRT reconstruction using first K_small primes
-    // This gives approximate values good enough for delta estimation
-    double p_approx = 0.0;
-    double q_approx = 0.0;
-    double scale = 1.0;
+    u32 p_residues[MAX_K_SMALL];
+    u32 q_residues[MAX_K_SMALL];
     
-    for (int k = 0; k < K_small && k < K; k++) {
-        u32 pk = d_primes[k].p;
-        u32 p_val = P_rns[k * B * mm + b * mm + p_idx];
-        u32 q_val = P_rns[k * B * mm + b * mm + q_idx];
-        
-        // Simple weighted average (not true CRT, but fast approximation)
-        p_approx = p_approx * pk + p_val;
-        q_approx = q_approx * pk + q_val;
-        scale *= pk;
+    for (int k = 0; k < K_small; k++) {
+        p_residues[k] = P_rns[k * B * mm + b * mm + p_idx];
+        q_residues[k] = P_rns[k * B * mm + b * mm + q_idx];
     }
     
-    // Normalize and compute ratio
-    if (q_approx == 0.0) {
+    // Reconstruct p and q using partial CRT
+    U256 p_val, q_val;
+    crt_reconstruct_partial(p_val, p_residues, K_small);
+    crt_reconstruct_partial(q_val, q_residues, K_small);
+    
+    // Convert to double for ratio computation
+    double p_float = u256_to_double(p_val);
+    double q_float = u256_to_double(q_val);
+    
+    // Handle edge cases
+    if (q_float == 0.0 || !isfinite(p_float) || !isfinite(q_float)) {
         deltas[b] = 1e10;
         log_qs[b] = 0.0;
         return;
     }
     
-    double ratio = p_approx / q_approx;
-    deltas[b] = fabs(ratio - target);
-    log_qs[b] = log(fabs(q_approx));
+    // Compute estimate and error
+    double estimate = p_float / q_float;
+    double err = fabs(estimate - target);
+    
+    // Compute log|q| from bit length
+    int q_bitlen = u256_bitlen(q_val);
+    double log_abs_q = q_bitlen * 0.693147180559945;  // ln(2)
+    
+    // Compute delta proxy: delta = -(1 + log(err) / log|q|)
+    // Higher delta = better (closer to limit)
+    if (err == 0.0 || log_abs_q == 0.0) {
+        deltas[b] = (err == 0.0) ? -100.0 : 1e10;  // Perfect match or bad
+        log_qs[b] = log_abs_q;
+        return;
+    }
+    
+    double log_err = log(err);
+    double delta = -(1.0 + log_err / log_abs_q);
+    
+    deltas[b] = err;  // Store absolute error for now (simpler threshold)
+    log_qs[b] = log_abs_q;
 }
 
 // TopK selection kernel

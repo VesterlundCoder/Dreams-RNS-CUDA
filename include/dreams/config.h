@@ -10,20 +10,50 @@
   #define DREAMS_GLOBAL __global__
   #define DREAMS_SHARED __shared__
   #define DREAMS_CONSTANT __constant__
+  #define DREAMS_FORCEINLINE __forceinline__
 #else
   #define DREAMS_HOST_DEVICE
   #define DREAMS_DEVICE
   #define DREAMS_GLOBAL
   #define DREAMS_SHARED
   #define DREAMS_CONSTANT
+  #define DREAMS_FORCEINLINE inline
 #endif
 
 namespace dreams {
 
+// ============================================================================
+// NUMERIC TYPES
+// ============================================================================
 using u32 = uint32_t;
 using u64 = uint64_t;
 using i32 = int32_t;
 using i64 = int64_t;
+
+// 128-bit unsigned integer (host only, use helpers on device)
+#ifndef __CUDA_ARCH__
+using u128 = unsigned __int128;
+#endif
+
+// 256-bit integer as 4 x u64 limbs (for CRT reconstruction)
+struct alignas(32) U256 {
+    u64 limbs[4];  // limbs[0] = low, limbs[3] = high
+    
+    DREAMS_HOST_DEVICE U256() : limbs{0, 0, 0, 0} {}
+    DREAMS_HOST_DEVICE U256(u64 v) : limbs{v, 0, 0, 0} {}
+};
+
+// ============================================================================
+// NUMERIC INVARIANTS (CRITICAL FOR CORRECTNESS)
+// ============================================================================
+// - Residues are stored in u32 (values in [0, p-1] where p < 2^31)
+// - Intermediate multiply: u64 product = (u64)a * (u64)b < 2^62
+// - Accumulation: For matrix size m, we accumulate m products.
+//   Worst case: m * (p-1)^2 ≈ m * 2^62
+//   For m <= 4: safe in u64 without intermediate reduction
+//   For m > 4: MUST reduce after each multiply-add to prevent u64 overflow
+// - Barrett reduction requires: input < p * 2^32 (satisfied by u64 products)
+// ============================================================================
 
 // RNS Configuration
 constexpr int MAX_K = 128;              // Max primes
@@ -31,6 +61,13 @@ constexpr int DEFAULT_K = 64;           // Default primes (64 * 31 = 1984 bits)
 constexpr int PRIME_BITS = 31;
 constexpr u32 PRIME_MIN = 1u << 30;
 constexpr u32 PRIME_MAX = (1u << 31) - 1;
+
+// Partial CRT Configuration (for GPU delta scoring)
+constexpr int DEFAULT_K_SMALL = 8;      // Primes for partial CRT (8 * 31 = 248 bits)
+constexpr int MAX_K_SMALL = 16;         // Max primes for partial CRT
+
+// Safe accumulation threshold: for m > SAFE_M_THRESHOLD, reduce every iteration
+constexpr int SAFE_M_THRESHOLD = 4;
 
 // Matrix Configuration
 constexpr int MAX_M = 8;                // Max matrix dimension
@@ -114,13 +151,21 @@ struct CmfProgram {
 // Walk configuration
 struct WalkConfig {
     int K;                          // Number of primes
+    int K_small;                    // Primes for partial CRT scoring
     int B;                          // Batch size (shifts)
     int m;                          // Matrix dimension
     int dim;                        // Number of axes
     int depth;                      // Walk depth
     int topk;                       // Top-K to keep
     double target;                  // Target constant (e.g., pi)
+    double delta_threshold;         // Hit threshold
     int snapshot_depths[2];         // Depths for delta computation
+    bool use_float_shadow;          // Optional float64 shadow for debugging
+};
+
+// Lane status for dead-lane tracking (e.g., division by zero)
+struct LaneStatus {
+    bool alive;                     // false if lane encountered error (e.g., inv(0))
 };
 
 } // namespace dreams

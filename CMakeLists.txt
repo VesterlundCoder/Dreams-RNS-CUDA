@@ -52,12 +52,21 @@ endif()
 if(DREAMS_ENABLE_TESTS)
     enable_testing()
     
+    # Basic persistent kernel tests
     add_executable(test_persistent tests/test_persistent.cpp)
     target_link_libraries(test_persistent dreams_lib)
     if(DREAMS_ENABLE_GPU)
         set_target_properties(test_persistent PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
     endif()
     add_test(NAME test_persistent COMMAND test_persistent)
+    
+    # Matmul and CRT correctness tests
+    add_executable(test_matmul_crt tests/test_matmul_crt.cpp)
+    target_link_libraries(test_matmul_crt dreams_lib)
+    if(DREAMS_ENABLE_GPU)
+        set_target_properties(test_matmul_crt PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    endif()
+    add_test(NAME test_matmul_crt COMMAND test_matmul_crt)
 endif()
 
 # Configuration summary

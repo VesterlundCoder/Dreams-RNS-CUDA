@@ -16,14 +16,16 @@ from .compiler import CmfProgram, Opcode
 @dataclass
 class WalkConfig:
     """Configuration for walk execution."""
-    K: int = 64                     # Number of primes
+    K: int = 64                     # Number of primes (64 * 31 = 1984 bits)
+    K_small: int = 8                # Primes for partial CRT scoring (8 * 31 = 248 bits)
     B: int = 1000                   # Batch size (shifts per CMF)
     depth: int = 2000               # Walk depth
     topk: int = 100                 # Top-K hits to keep
     target: float = math.pi         # Target constant
     snapshot_depths: Tuple[int, int] = (200, 2000)
     delta_threshold: float = 1e-6   # Hit threshold
-    use_float_shadow: bool = True   # Use float64 shadow for quick delta
+    use_float_shadow: bool = False  # Optional float64 shadow (for debugging only)
+    use_crt_scoring: bool = True    # Use partial CRT for delta scoring (default)
 
 
 @dataclass
@@ -81,6 +83,74 @@ def compute_barrett_mu(primes: np.ndarray) -> np.ndarray:
         p_int = int(p)
         mus[i] = ((1 << 63) // p_int) * 2
     return mus
+
+
+def crt_reconstruct_partial(residues: np.ndarray, primes: np.ndarray) -> int:
+    """
+    Reconstruct integer from residues using iterative CRT.
+    
+    Args:
+        residues: Array of residues [K_small]
+        primes: Array of primes [K_small]
+    
+    Returns:
+        Reconstructed integer (Python int, arbitrary precision)
+    """
+    x = int(residues[0])
+    M = int(primes[0])
+    
+    for i in range(1, len(residues)):
+        p_i = int(primes[i])
+        a_i = int(residues[i])
+        
+        # Compute x mod p_i
+        x_mod_pi = x % p_i
+        
+        # Compute M mod p_i
+        M_mod_pi = M % p_i
+        
+        # Compute M_inv = inverse of M mod p_i using extended Euclidean algorithm
+        M_inv = pow(M_mod_pi, p_i - 2, p_i)  # Fermat's little theorem
+        
+        # Compute t = (a_i - x_mod_pi) * M_inv mod p_i
+        diff = (a_i - x_mod_pi) % p_i
+        t = (diff * M_inv) % p_i
+        
+        # Update x = x + M * t
+        x = x + M * t
+        
+        # Update M = M * p_i
+        M = M * p_i
+    
+    return x
+
+
+def compute_delta_from_crt(p_residues: np.ndarray, q_residues: np.ndarray,
+                           primes: np.ndarray, target: float) -> Tuple[float, float]:
+    """
+    Compute delta and log_q from RNS residues using partial CRT.
+    
+    Args:
+        p_residues: p value residues [K_small]
+        q_residues: q value residues [K_small]
+        primes: primes used [K_small]
+        target: target constant
+    
+    Returns:
+        (delta, log_q) tuple
+    """
+    p_val = crt_reconstruct_partial(p_residues, primes)
+    q_val = crt_reconstruct_partial(q_residues, primes)
+    
+    if q_val == 0:
+        return 1e10, 0.0
+    
+    # Use high-precision division
+    ratio = p_val / q_val
+    delta = abs(ratio - target)
+    log_q = math.log(abs(q_val)) if q_val != 0 else 0.0
+    
+    return delta, log_q
 
 
 class DreamsRunner:
@@ -331,24 +401,52 @@ class DreamsRunner:
             
             # Check for hits at snapshot depths
             if step + 1 in self.config.snapshot_depths:
-                p_vals = P_float[:, 0, -1]
-                q_vals = P_float[:, 1, -1]
-                
-                valid = cp.abs(q_vals) > 1e-10
-                ratios = cp.where(valid, p_vals / q_vals, 0.0)
-                deltas = cp.abs(ratios - self.target)
-                
-                hit_mask = (deltas < self.config.delta_threshold) & valid
-                hit_indices = cp.where(hit_mask)[0]
-                
-                for idx in hit_indices.get():
-                    hits.append(Hit(
-                        cmf_idx=cmf_idx,
-                        shift=list(shifts[idx]),
-                        depth=step + 1,
-                        delta=float(deltas[idx].get()),
-                        log_q=float(log_scale[idx].get() + cp.log(cp.abs(q_vals[idx])).get())
-                    ))
+                if self.config.use_crt_scoring:
+                    # CRT-based scoring (PRIMARY method)
+                    K_small = min(self.config.K_small, K)
+                    
+                    # Extract p and q residues for first K_small primes
+                    p_residues = P_rns[:K_small, :, 0, -1].get()  # [K_small, B]
+                    q_residues = P_rns[:K_small, :, 1, -1].get()  # [K_small, B]
+                    primes_small = self._primes[:K_small]
+                    
+                    # Compute delta for each shift using CRT
+                    for b in range(B):
+                        p_res = p_residues[:, b]
+                        q_res = q_residues[:, b]
+                        
+                        delta, log_q = compute_delta_from_crt(
+                            p_res, q_res, primes_small, self.target
+                        )
+                        
+                        if delta < self.config.delta_threshold:
+                            hits.append(Hit(
+                                cmf_idx=cmf_idx,
+                                shift=list(shifts[b]),
+                                depth=step + 1,
+                                delta=delta,
+                                log_q=log_q
+                            ))
+                else:
+                    # Float shadow scoring (optional, for debugging)
+                    p_vals = P_float[:, 0, -1]
+                    q_vals = P_float[:, 1, -1]
+                    
+                    valid = cp.abs(q_vals) > 1e-10
+                    ratios = cp.where(valid, p_vals / q_vals, 0.0)
+                    deltas = cp.abs(ratios - self.target)
+                    
+                    hit_mask = (deltas < self.config.delta_threshold) & valid
+                    hit_indices = cp.where(hit_mask)[0]
+                    
+                    for idx in hit_indices.get():
+                        hits.append(Hit(
+                            cmf_idx=cmf_idx,
+                            shift=list(shifts[idx]),
+                            depth=step + 1,
+                            delta=float(deltas[idx].get()),
+                            log_q=float(log_scale[idx].get() + cp.log(cp.abs(q_vals[idx])).get())
+                        ))
         
         return hits
     
