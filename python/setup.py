@@ -17,4 +17,10 @@ setup(
         "precision": ["mpmath>=1.2.0"],
         "dev": ["pytest>=6.0.0"],
     },
+      extra_cuda_cflags=[
+        "-03",
+        "--use_fast_math",
+        "--maxrregcount=80",
+       "--lineinfo",
+    ]
 )
