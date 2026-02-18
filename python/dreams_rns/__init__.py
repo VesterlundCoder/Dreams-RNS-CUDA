@@ -10,6 +10,7 @@ Correct PCF walk convention (matching ramanujantools):
 
 from .compiler import compile_cmf, compile_cmf_from_dict, CmfCompiler, CmfProgram, Opcode
 from .constants import load_constants, match_against_constants, compute_delta_against_constant
+from .gpu_walk import gpu_available, run_pcf_walk_gpu, run_pcf_walk_batch_gpu
 from .runner import (
     WalkConfig,
     generate_rns_primes,

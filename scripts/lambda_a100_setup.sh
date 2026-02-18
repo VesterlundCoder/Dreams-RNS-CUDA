@@ -21,6 +21,7 @@ echo "============================================================"
 sudo apt-get update -qq
 sudo apt-get install -y -qq python3-pip git
 pip3 install --quiet numpy sympy mpmath scipy
+pip3 install --quiet cupy-cuda12x
 
 # ── 2. Clone / update repo ──────────────────────────────────────────
 cd ~
