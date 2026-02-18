@@ -37,6 +37,61 @@ import sympy as sp
 import mpmath as mp
 
 
+def estimate_K(a_str: str, b_str: str, depth: int, safety: float = 1.5) -> int:
+    """Estimate K primes needed for exact CRT reconstruction.
+
+    Growth of convergent: |q_N| ≈ ∏(n=1..N) ||M(n)|| where M(n) has entries
+    of degree d with max coefficient c. Bits needed ≈ d * log2(N!) + N * log2(c).
+
+    Args:
+        a_str, b_str: polynomial strings
+        depth: walk depth N
+        safety: multiplier for safety margin (default 1.5)
+
+    Returns:
+        K: number of 31-bit primes needed
+    """
+    try:
+        a_expr = sp.sympify(a_str)
+        b_expr = sp.sympify(b_str)
+        n = sp.Symbol('n')
+
+        # Get polynomial degrees
+        deg_a = sp.degree(a_expr, n) if a_expr.has(n) else 0
+        deg_b = sp.degree(b_expr, n) if b_expr.has(n) else 0
+        max_deg = max(int(deg_a), int(deg_b), 1)
+
+        # Get max absolute coefficient
+        max_coeff = 1
+        for expr in [a_expr, b_expr]:
+            try:
+                poly = sp.Poly(expr, n)
+                for c in poly.all_coeffs():
+                    max_coeff = max(max_coeff, abs(int(c)))
+            except Exception:
+                max_coeff = max(max_coeff, 100)
+
+        # Stirling: log2(N!) ≈ N*log2(N/e) + 0.5*log2(2πN)
+        if depth > 1:
+            log2_fact = depth * math.log2(depth / math.e) + 0.5 * math.log2(2 * math.pi * depth)
+        else:
+            log2_fact = 1
+
+        # Bits for convergent growth
+        coeff_bits = math.log2(max_coeff + 1) if max_coeff > 1 else 0
+        bits_needed = max_deg * log2_fact + depth * coeff_bits
+
+        # Safety margin + minimum
+        bits_needed = int(bits_needed * safety) + 100
+        K = max(bits_needed // 31 + 1, 64)
+
+        return K
+    except Exception:
+        # Conservative fallback: assume degree 4, large coefficients
+        log2_fact = depth * math.log2(max(depth, 2) / math.e)
+        return max(int(4 * log2_fact * safety / 31) + 1, 1000)
+
+
 def parse_limit(limit_str: str, dps: int = 200):
     """Parse a limit expression like '2/(4 - pi)' to mpmath value."""
     mp.mp.dps = dps
@@ -99,7 +154,8 @@ def crt_overflowed(p_big, q_big, est_float):
     if q_big == 0:
         return True
     try:
-        crt_ratio = float(p_big) / float(q_big)
+        # Use mpmath for huge integers that exceed float64 range
+        crt_ratio = float(mp.mpf(p_big) / mp.mpf(q_big))
         if not math.isfinite(crt_ratio) or not math.isfinite(est_float):
             return True
         # If CRT ratio disagrees with float estimate by more than 1%, CRT overflowed
@@ -134,7 +190,8 @@ def main():
     parser.add_argument("--input", type=str, required=True,
                         help="Path to cmf_pcfs.json or pcfs.json")
     parser.add_argument("--depth", type=int, default=2000)
-    parser.add_argument("--K", type=int, default=32)
+    parser.add_argument("--K", type=int, default=0,
+                        help="Number of RNS primes (0=auto per PCF)")
     parser.add_argument("--dps", type=int, default=200,
                         help="mpmath decimal precision")
     parser.add_argument("--max-tasks", type=int, default=0,
@@ -222,7 +279,13 @@ def main():
 
             # Walk once (PCF walk is same for all sources of same PCF)
             try:
-                res = run_pcf_walk(program, a0, args.depth, args.K)
+                # Auto-K: estimate primes needed for exact CRT
+                if args.K > 0:
+                    K_use = args.K
+                else:
+                    K_use = estimate_K(a_str, b_str, args.depth)
+
+                res = run_pcf_walk(program, a0, args.depth, K_use)
 
                 # CRT reconstruction
                 primes = [int(p) for p in res['primes']]
@@ -307,7 +370,7 @@ def main():
                 method_tag = f"[{delta_method}]"
                 print(f"  [{pi+1:>5}/{len(records)}] {status} "
                       f"δ_cuda={delta_show:>10} δ_ref={ref_show:>10} "
-                      f"diff={diff:.6f} {method_tag} est={est:.8f} "
+                      f"diff={diff:.6f} {method_tag} K={K_use} est={est:.8f} "
                       f"({elapsed:.1f}s) {len(sources)}src a={a_str[:40]}")
 
             except Exception as e:

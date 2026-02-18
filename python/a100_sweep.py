@@ -104,7 +104,14 @@ def run_euler2ai_mode(args, constants):
                 continue
 
             a0 = pcf_initial_values(a_str)
-            res = run_pcf_walk(program, a0, args.depth, args.K)
+
+            # Auto-K: estimate primes needed for exact CRT
+            K_use = args.K
+            if K_use <= 64:
+                from euler2ai_full_verify import estimate_K
+                K_use = estimate_K(a_str, b_str, args.depth)
+
+            res = run_pcf_walk(program, a0, args.depth, K_use)
 
             # CRT reconstruction
             primes = [int(p) for p in res['primes']]
@@ -126,7 +133,8 @@ def run_euler2ai_mode(args, constants):
                 crt_valid = False
             else:
                 try:
-                    crt_ratio = float(p_big) / float(q_big)
+                    import mpmath as _mp
+                    crt_ratio = float(_mp.mpf(p_big) / _mp.mpf(q_big))
                     if not math.isfinite(crt_ratio):
                         crt_valid = False
                     elif abs(est) > 1e-10:
