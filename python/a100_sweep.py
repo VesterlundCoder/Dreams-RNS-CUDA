@@ -55,17 +55,17 @@ def _lazy_cmf_imports():
 # ── Euler2AI mode ────────────────────────────────────────────────────────
 
 def load_pcfs_json(path: str) -> List[Dict]:
-    """Load PCFs from Euler2AI pcfs.json (JSONL: one JSON object per line)."""
-    records = []
+    """Load PCFs from cmf_pcfs.json / pcfs.json, expanding per-source.
+
+    Each source (trajectory+shift pair) becomes a separate task.
+    For cmf_pcfs.json: 1693 PCFs × ~3 sources = 5192 tasks.
+    """
     with open(path) as f:
         first_char = f.read(1)
         f.seek(0)
-
         if first_char == '[':
-            # Single JSON array
             items = json.load(f)
         else:
-            # JSONL: one JSON object per line
             items = []
             for line in f:
                 line = line.strip()
@@ -75,84 +75,122 @@ def load_pcfs_json(path: str) -> List[Dict]:
                     except json.JSONDecodeError:
                         continue
 
-    for rec in items:
-        if 'a' in rec and 'b' in rec:
-            records.append({
+    tasks = []
+    for pi, rec in enumerate(items):
+        if 'a' not in rec or 'b' not in rec:
+            continue
+        sources = rec.get('sources', [None])
+        if not sources:
+            sources = [None]
+        for si, src in enumerate(sources):
+            tasks.append({
                 'a': str(rec['a']),
                 'b': str(rec['b']),
                 'limit': rec.get('limit', None),
+                'delta_ref': rec.get('delta', None),
+                'pcf_idx': pi,
+                'source_idx': si,
+                'trajectory': src[0] if src and isinstance(src, list) else None,
+                'shift': src[1] if src and isinstance(src, list) and len(src) > 1 else None,
             })
-    return records
+    return tasks
 
 
 def run_euler2ai_mode(args, constants):
-    """Run Euler2AI PCF verification with multi-constant matching."""
-    records = load_pcfs_json(args.input)
-    if args.max_tasks > 0:
-        records = records[:args.max_tasks]
+    """Run Euler2AI PCF verification with multi-constant matching.
 
-    print(f"Loaded {len(records)} PCFs from {args.input}")
+    Expands per-source tasks from cmf_pcfs.json (1693 PCFs → 5192 tasks).
+    Walks once per unique PCF (cached), reports per-source.
+    """
+    tasks = load_pcfs_json(args.input)
+    if args.max_tasks > 0:
+        tasks = tasks[:args.max_tasks]
+
+    n_unique = len(set((t['a'], t['b']) for t in tasks))
+    print(f"Loaded {len(tasks)} tasks ({n_unique} unique PCFs) from {args.input}")
     print(f"Testing against {len(constants)} mathematical constants")
-    print(f"Depth={args.depth}, K={args.K}")
+    print(f"Depth={args.depth}, K={'auto' if args.K == 0 else args.K}")
     print(f"{'='*80}")
 
     hits = []
     all_results = []
+    walk_cache = {}  # (a, b) -> walk_result or None
 
-    for i, rec in enumerate(records):
-        a_str, b_str = rec['a'], rec['b']
-        limit_str = rec.get('limit', None)
+    for i, task in enumerate(tasks):
+        a_str, b_str = task['a'], task['b']
+        limit_str = task.get('limit', None)
+        pcf_key = (a_str, b_str)
         t0 = time.time()
 
         try:
-            program = compile_pcf(a_str, b_str)
-            if program is None:
-                print(f"  [{i+1}/{len(records)}] SKIP (compile fail): a={a_str}, b={b_str}")
+            # Use cached walk result if available
+            if pcf_key not in walk_cache:
+                program = compile_pcf(a_str, b_str)
+                if program is None:
+                    walk_cache[pcf_key] = None
+                    print(f"  [{i+1:>5}/{len(tasks)}] SKIP (compile fail): a={a_str}")
+                    continue
+
+                a0 = pcf_initial_values(a_str)
+
+                # Auto-K
+                if args.K > 0:
+                    K_use = args.K
+                else:
+                    from euler2ai_full_verify import estimate_K
+                    K_use = estimate_K(a_str, b_str, args.depth)
+
+                res = run_pcf_walk(program, a0, args.depth, K_use)
+
+                # CRT reconstruction
+                primes = [int(p) for p in res['primes']]
+                p_big, Mp = crt_reconstruct([int(r) for r in res['p_residues']], primes)
+                q_big, _ = crt_reconstruct([int(r) for r in res['q_residues']], primes)
+                p_big = centered(p_big, Mp)
+                q_big = centered(q_big, Mp)
+
+                est = res['p_float'] / res['q_float'] if abs(res['q_float']) > 1e-300 else float('nan')
+                log_scale = res.get('log_scale', 0.0)
+                q_float = res['q_float']
+
+                # CRT overflow check
+                crt_valid = True
+                if q_big == 0 or not math.isfinite(est):
+                    crt_valid = False
+                else:
+                    try:
+                        import mpmath as _mp
+                        crt_ratio = float(_mp.mpf(p_big) / _mp.mpf(q_big))
+                        if not math.isfinite(crt_ratio):
+                            crt_valid = False
+                        elif abs(est) > 1e-10:
+                            crt_valid = abs(crt_ratio - est) / abs(est) < 0.01
+                        else:
+                            crt_valid = abs(crt_ratio - est) < 0.01
+                    except Exception:
+                        crt_valid = False
+
+                walk_cache[pcf_key] = {
+                    'est': est, 'log_scale': log_scale, 'q_float': q_float,
+                    'p_big': p_big, 'q_big': q_big, 'Mp': Mp,
+                    'crt_valid': crt_valid, 'K_use': K_use,
+                }
+            elif walk_cache[pcf_key] is None:
                 continue
 
-            a0 = pcf_initial_values(a_str)
-
-            # Auto-K: estimate primes needed for exact CRT
-            if args.K > 0:
-                K_use = args.K
-            else:
-                from euler2ai_full_verify import estimate_K
-                K_use = estimate_K(a_str, b_str, args.depth)
-
-            res = run_pcf_walk(program, a0, args.depth, K_use)
-
-            # CRT reconstruction
-            primes = [int(p) for p in res['primes']]
-            p_big, Mp = crt_reconstruct([int(r) for r in res['p_residues']], primes)
-            q_big, _ = crt_reconstruct([int(r) for r in res['q_residues']], primes)
-            p_big = centered(p_big, Mp)
-            q_big = centered(q_big, Mp)
-
-            # Float estimate
-            est = res['p_float'] / res['q_float'] if abs(res['q_float']) > 1e-300 else float('nan')
-            log_scale = res.get('log_scale', 0.0)
-            q_float = res['q_float']
+            wc = walk_cache[pcf_key]
+            est = wc['est']
+            log_scale = wc['log_scale']
+            q_float = wc['q_float']
+            p_big = wc['p_big']
+            q_big = wc['q_big']
+            Mp = wc['Mp']
+            crt_valid = wc['crt_valid']
+            K_use = wc['K_use']
 
             elapsed = time.time() - t0
 
-            # Detect CRT overflow: compare CRT ratio with float shadow
-            crt_valid = True
-            if q_big == 0 or not math.isfinite(est):
-                crt_valid = False
-            else:
-                try:
-                    import mpmath as _mp
-                    crt_ratio = float(_mp.mpf(p_big) / _mp.mpf(q_big))
-                    if not math.isfinite(crt_ratio):
-                        crt_valid = False
-                    elif abs(est) > 1e-10:
-                        crt_valid = abs(crt_ratio - est) / abs(est) < 0.01
-                    else:
-                        crt_valid = abs(crt_ratio - est) < 0.01
-                except Exception:
-                    crt_valid = False
-
-            # 1. Delta against stated limit (each Euler2AI PCF has its own target)
+            # 1. Delta against stated limit
             delta_stated = float('-inf')
             limit_float = None
             if limit_str:
@@ -168,7 +206,6 @@ def run_euler2ai_mode(args, constants):
                         delta_stated = float(compute_delta_against_constant(
                             p_big, q_big, target_mp, args.dps))
                     else:
-                        # CRT overflow — use float shadow delta
                         err = abs(est - limit_float)
                         if err > 0:
                             log_err = math.log(err)
@@ -178,7 +215,7 @@ def run_euler2ai_mode(args, constants):
                 except Exception:
                     pass
 
-            # 2. Delta against all 15 bank constants
+            # 2. Delta against bank constants
             matches = match_against_constants(est, constants, args.proximity)
             best_delta = float('-inf')
             best_const = None
@@ -186,7 +223,6 @@ def run_euler2ai_mode(args, constants):
                 if crt_valid:
                     delta = compute_delta_against_constant(p_big, q_big, c['value'], args.dps)
                 else:
-                    # Float delta for bank constants too
                     try:
                         err = abs(est - c['value_float'])
                         if err > 0:
@@ -202,9 +238,13 @@ def run_euler2ai_mode(args, constants):
                     best_const = c['name']
 
             result = {
-                'idx': i,
+                'task_idx': i,
+                'pcf_idx': task.get('pcf_idx', i),
+                'source_idx': task.get('source_idx', 0),
                 'a': a_str,
                 'b': b_str,
+                'trajectory': str(task.get('trajectory', '')),
+                'shift': str(task.get('shift', '')),
                 'limit_stated': limit_str or '',
                 'limit_float': limit_float,
                 'delta_stated': delta_stated,
@@ -212,26 +252,29 @@ def run_euler2ai_mode(args, constants):
                 'best_const': best_const,
                 'best_delta': best_delta,
                 'p_bits': Mp.bit_length(),
+                'K': K_use,
                 'elapsed_s': elapsed,
                 'matches': [m['name'] for m in matches],
             }
             all_results.append(result)
 
-            # Hit if: stated delta > 0, or bank delta > 0, or proximity match
             is_hit = delta_stated > 0 or best_delta > 0 or len(matches) > 0
             status = "HIT" if is_hit else "---"
             if is_hit:
                 hits.append(result)
 
-            match_str = ', '.join(m['name'] for m in matches[:3]) if matches else '-'
-            delta_show = delta_stated if delta_stated > best_delta else best_delta
-            const_show = 'stated' if delta_stated > best_delta else best_const
-            print(f"  [{i+1:>4}/{len(records)}] {status} δ={delta_show:>8.4f} "
-                  f"→{const_show:<12} est={est:.8f} "
-                  f"matches=[{match_str}] ({elapsed:.1f}s) a={a_str}")
+            # Print progress only for first source of each PCF
+            if pcf_key not in {(t['a'], t['b']) for t in tasks[:i]}:
+                match_str = ', '.join(m['name'] for m in matches[:3]) if matches else '-'
+                delta_show = delta_stated if delta_stated > best_delta else best_delta
+                const_show = 'stated' if delta_stated > best_delta else best_const
+                n_src = sum(1 for t in tasks if (t['a'], t['b']) == pcf_key)
+                print(f"  [{i+1:>5}/{len(tasks)}] {status} δ={delta_show:>8.4f} "
+                      f"→{const_show:<12} est={est:.8f} K={K_use} "
+                      f"({elapsed:.1f}s) {n_src}src a={a_str[:40]}")
 
         except Exception as e:
-            print(f"  [{i+1}/{len(records)}] ERROR: {e} | a={a_str}, b={b_str}")
+            print(f"  [{i+1}/{len(tasks)}] ERROR: {e} | a={a_str}")
 
     return all_results, hits
 

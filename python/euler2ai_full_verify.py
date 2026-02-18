@@ -206,13 +206,32 @@ def main():
 
     # Load data
     records = load_cmf_pcfs(args.input)
-    if args.max_tasks > 0:
-        records = records[:args.max_tasks]
 
-    # Expand per-source
-    total_sources = sum(len(r.get('sources', [{}])) for r in records)
-    print(f"Loaded {len(records)} unique PCFs, {total_sources} total sources")
-    print(f"Depth={args.depth}, K={args.K}, dps={args.dps}")
+    # Expand to per-source tasks: each source (trajectory+shift) is a separate task
+    tasks = []
+    for pi, rec in enumerate(records):
+        sources = rec.get('sources', [None])
+        if not sources:
+            sources = [None]
+        for si, src in enumerate(sources):
+            tasks.append({
+                'pcf_idx': pi,
+                'source_idx': si,
+                'a': rec['a'],
+                'b': rec['b'],
+                'limit': rec.get('limit', ''),
+                'delta_ref': rec.get('delta', None),
+                'conv_rate': rec.get('convergence_rate', None),
+                'trajectory': src[0] if src and isinstance(src, list) else None,
+                'shift': src[1] if src and isinstance(src, list) and len(src) > 1 else None,
+            })
+
+    if args.max_tasks > 0:
+        tasks = tasks[:args.max_tasks]
+
+    n_unique_pcfs = len(set((t['a'], t['b']) for t in tasks))
+    print(f"Loaded {len(tasks)} tasks ({n_unique_pcfs} unique PCFs)")
+    print(f"Depth={args.depth}, K={'auto' if args.K == 0 else args.K}, dps={args.dps}")
     print(f"Delta tolerance: {args.delta_tol}")
     print(f"Output: {args.output}")
     print(f"{'='*90}")
@@ -221,10 +240,10 @@ def main():
     os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else '.', exist_ok=True)
 
     fieldnames = [
-        'pcf_idx', 'source_idx', 'a', 'b', 'limit',
+        'task_idx', 'pcf_idx', 'source_idx', 'a', 'b', 'limit',
         'trajectory', 'shift',
         'delta_ref_cpu', 'convergence_rate_ref',
-        'delta_cuda_rns', 'est_float',
+        'delta_cuda_rns', 'delta_method', 'est_float',
         'delta_diff', 'match',
         'p_bits', 'depth', 'K',
     ]
@@ -235,166 +254,189 @@ def main():
     n_error = 0
     t_global = time.time()
 
+    # Cache: compiled programs and walk results per unique (a, b)
+    walk_cache = {}
+
     with open(args.output, 'w', newline='') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
 
-        for pi, rec in enumerate(records):
-            a_str = rec['a']
-            b_str = rec['b']
-            limit_str = rec.get('limit', '')
-            delta_ref = rec.get('delta', None)
-            conv_rate = rec.get('convergence_rate', None)
-            sources = rec.get('sources', [None])
+        for ti, task in enumerate(tasks):
+            a_str = task['a']
+            b_str = task['b']
+            limit_str = task['limit']
+            delta_ref = task['delta_ref']
+            conv_rate = task['conv_rate']
+            traj = task['trajectory']
+            shift = task['shift']
+
+            pcf_key = (a_str, b_str)
+            traj_str = str(traj) if traj else ''
+            shift_str = str(shift) if shift else ''
 
             t0 = time.time()
 
-            # Parse limit
-            target_mp = parse_limit(limit_str, args.dps) if limit_str else None
+            # Use cached walk result if available (same PCF = same walk)
+            if pcf_key in walk_cache:
+                cached = walk_cache[pcf_key]
+                if cached is None:
+                    n_skip += 1
+                    writer.writerow({
+                        'task_idx': ti, 'pcf_idx': task['pcf_idx'],
+                        'source_idx': task['source_idx'],
+                        'a': a_str, 'b': b_str, 'limit': limit_str,
+                        'trajectory': traj_str, 'shift': shift_str,
+                        'delta_ref_cpu': delta_ref, 'convergence_rate_ref': conv_rate,
+                        'delta_cuda_rns': 'SKIP', 'delta_method': '',
+                        'est_float': '', 'delta_diff': '', 'match': 'SKIP',
+                        'p_bits': '', 'depth': args.depth, 'K': '',
+                    })
+                    continue
+                est, delta_cuda, delta_method, p_bits, K_use, diff, is_match = cached
+            else:
+                # Parse limit
+                target_mp = parse_limit(limit_str, args.dps) if limit_str else None
 
-            # Compile PCF once
-            try:
-                program = compile_pcf(a_str, b_str)
-                if program is None:
-                    n_skip += len(sources)
-                    print(f"  [{pi+1:>5}/{len(records)}] SKIP (imaginary): a={a_str}")
-                    for si, src in enumerate(sources):
+                # Compile PCF
+                try:
+                    program = compile_pcf(a_str, b_str)
+                    if program is None:
+                        walk_cache[pcf_key] = None
+                        n_skip += 1
+                        print(f"  [{ti+1:>5}/{len(tasks)}] SKIP (imaginary): a={a_str}")
                         writer.writerow({
-                            'pcf_idx': pi, 'source_idx': si,
+                            'task_idx': ti, 'pcf_idx': task['pcf_idx'],
+                            'source_idx': task['source_idx'],
                             'a': a_str, 'b': b_str, 'limit': limit_str,
-                            'trajectory': str(src[0]) if src and isinstance(src, list) else '',
-                            'shift': str(src[1]) if src and isinstance(src, list) and len(src) > 1 else '',
+                            'trajectory': traj_str, 'shift': shift_str,
                             'delta_ref_cpu': delta_ref, 'convergence_rate_ref': conv_rate,
-                            'delta_cuda_rns': 'SKIP', 'est_float': '',
-                            'delta_diff': '', 'match': 'SKIP',
-                            'p_bits': '', 'depth': args.depth, 'K': args.K,
+                            'delta_cuda_rns': 'SKIP', 'delta_method': '',
+                            'est_float': '', 'delta_diff': '', 'match': 'SKIP',
+                            'p_bits': '', 'depth': args.depth, 'K': '',
                         })
+                        continue
+                    a0 = pcf_initial_values(a_str)
+                except Exception as e:
+                    walk_cache[pcf_key] = None
+                    n_error += 1
+                    print(f"  [{ti+1:>5}/{len(tasks)}] ERROR compile: {e}")
                     continue
 
-                a0 = pcf_initial_values(a_str)
-            except Exception as e:
-                n_error += len(sources)
-                print(f"  [{pi+1:>5}/{len(records)}] ERROR compile: {e} | a={a_str}")
-                continue
-
-            # Walk once (PCF walk is same for all sources of same PCF)
-            try:
-                # Auto-K: estimate primes needed for exact CRT
-                if args.K > 0:
-                    K_use = args.K
-                else:
-                    K_use = estimate_K(a_str, b_str, args.depth)
-
-                res = run_pcf_walk(program, a0, args.depth, K_use)
-
-                # CRT reconstruction
-                primes = [int(p) for p in res['primes']]
-                p_big, Mp = crt_reconstruct(
-                    [int(r) for r in res['p_residues']], primes)
-                q_big, _ = crt_reconstruct(
-                    [int(r) for r in res['q_residues']], primes)
-                p_big = centered(p_big, Mp)
-                q_big = centered(q_big, Mp)
-
-                est = (res['p_float'] / res['q_float']
-                       if abs(res['q_float']) > 1e-300 else float('nan'))
-
-                # Detect CRT overflow and choose delta method
-                overflow = crt_overflowed(p_big, q_big, est)
-
-                if target_mp is not None:
-                    if overflow:
-                        # CRT overflowed — use float shadow delta
-                        delta_cuda = compute_delta_float(
-                            est, float(target_mp),
-                            res.get('log_scale', 0.0),
-                            res['q_float'])
-                        delta_method = 'float'
+                # Walk
+                try:
+                    if args.K > 0:
+                        K_use = args.K
                     else:
-                        # CRT valid — use exact mpmath delta
-                        delta_cuda = compute_delta(p_big, q_big, target_mp, args.dps)
-                        delta_method = 'crt'
-                else:
-                    delta_cuda = float('nan')
-                    delta_method = 'none'
+                        K_use = estimate_K(a_str, b_str, args.depth)
 
-                p_bits = Mp.bit_length()
-                elapsed = time.time() - t0
+                    res = run_pcf_walk(program, a0, args.depth, K_use)
 
-                # Compare with reference — adaptive tolerance
-                # Slowly-converging PCFs (δ_ref < 0) need wider tolerance at
-                # finite depth because δ_computed ≈ δ_true - C/depth.
-                if delta_ref is not None and math.isfinite(delta_cuda):
-                    diff = abs(delta_cuda - delta_ref)
-                    tol = args.delta_tol
-                    if delta_ref < -0.5:
-                        tol = max(tol, 1.0)    # very slow convergence
-                    elif delta_ref < 0:
-                        tol = max(tol, 0.2)    # moderate convergence
-                    is_match = diff < tol
-                else:
-                    diff = float('nan')
-                    is_match = False
+                    # CRT reconstruction
+                    primes = [int(p) for p in res['primes']]
+                    p_big, Mp = crt_reconstruct(
+                        [int(r) for r in res['p_residues']], primes)
+                    q_big, _ = crt_reconstruct(
+                        [int(r) for r in res['q_residues']], primes)
+                    p_big = centered(p_big, Mp)
+                    q_big = centered(q_big, Mp)
 
-                # Write one row per source
-                for si, src in enumerate(sources):
-                    n_total += 1
-                    if is_match:
-                        n_match += 1
+                    est = (res['p_float'] / res['q_float']
+                           if abs(res['q_float']) > 1e-300 else float('nan'))
 
-                    traj_str = str(src[0]) if src and isinstance(src, list) else ''
-                    shift_str = str(src[1]) if src and isinstance(src, list) and len(src) > 1 else ''
+                    overflow = crt_overflowed(p_big, q_big, est)
 
+                    if target_mp is not None:
+                        if overflow:
+                            delta_cuda = compute_delta_float(
+                                est, float(target_mp),
+                                res.get('log_scale', 0.0), res['q_float'])
+                            delta_method = 'float'
+                        else:
+                            delta_cuda = compute_delta(p_big, q_big, target_mp, args.dps)
+                            delta_method = 'crt'
+                    else:
+                        delta_cuda = float('nan')
+                        delta_method = 'none'
+
+                    p_bits = Mp.bit_length()
+
+                    # Compare with reference — adaptive tolerance
+                    if delta_ref is not None and math.isfinite(delta_cuda):
+                        diff = abs(delta_cuda - delta_ref)
+                        tol = args.delta_tol
+                        if delta_ref < -0.5:
+                            tol = max(tol, 1.0)
+                        elif delta_ref < 0:
+                            tol = max(tol, 0.2)
+                        is_match = diff < tol
+                    else:
+                        diff = float('nan')
+                        is_match = False
+
+                    walk_cache[pcf_key] = (est, delta_cuda, delta_method,
+                                           p_bits, K_use, diff, is_match)
+
+                except Exception as e:
+                    walk_cache[pcf_key] = None
+                    n_error += 1
+                    print(f"  [{ti+1:>5}/{len(tasks)}] ERROR walk: {e} | a={a_str[:40]}")
                     writer.writerow({
-                        'pcf_idx': pi,
-                        'source_idx': si,
-                        'a': a_str,
-                        'b': b_str,
-                        'limit': limit_str,
-                        'trajectory': traj_str,
-                        'shift': shift_str,
-                        'delta_ref_cpu': f"{delta_ref:.5f}" if delta_ref is not None else '',
-                        'convergence_rate_ref': f"{conv_rate:.5f}" if conv_rate is not None else '',
-                        'delta_cuda_rns': f"{delta_cuda:.5f}" if math.isfinite(delta_cuda) else str(delta_cuda),
-                        'est_float': f"{est:.10f}" if math.isfinite(est) else str(est),
-                        'delta_diff': f"{diff:.6f}" if math.isfinite(diff) else '',
-                        'match': 'YES' if is_match else 'NO',
-                        'p_bits': p_bits,
-                        'depth': args.depth,
-                        'K': args.K,
+                        'task_idx': ti, 'pcf_idx': task['pcf_idx'],
+                        'source_idx': task['source_idx'],
+                        'a': a_str, 'b': b_str, 'limit': limit_str,
+                        'trajectory': traj_str, 'shift': shift_str,
+                        'delta_ref_cpu': delta_ref, 'convergence_rate_ref': conv_rate,
+                        'delta_cuda_rns': 'ERROR', 'delta_method': '',
+                        'est_float': '', 'delta_diff': '', 'match': 'ERROR',
+                        'p_bits': '', 'depth': args.depth, 'K': '',
                     })
+                    continue
 
+            # Write result row
+            n_total += 1
+            if is_match:
+                n_match += 1
+
+            writer.writerow({
+                'task_idx': ti,
+                'pcf_idx': task['pcf_idx'],
+                'source_idx': task['source_idx'],
+                'a': a_str,
+                'b': b_str,
+                'limit': limit_str,
+                'trajectory': traj_str,
+                'shift': shift_str,
+                'delta_ref_cpu': f"{delta_ref:.5f}" if delta_ref is not None else '',
+                'convergence_rate_ref': f"{conv_rate:.5f}" if conv_rate is not None else '',
+                'delta_cuda_rns': f"{delta_cuda:.5f}" if math.isfinite(delta_cuda) else str(delta_cuda),
+                'delta_method': delta_method,
+                'est_float': f"{est:.10f}" if math.isfinite(est) else str(est),
+                'delta_diff': f"{diff:.6f}" if math.isfinite(diff) else '',
+                'match': 'YES' if is_match else 'NO',
+                'p_bits': p_bits,
+                'depth': args.depth,
+                'K': K_use,
+            })
+
+            # Progress — print every unique PCF (not every source)
+            if pcf_key not in {(t['a'], t['b']) for t in tasks[:ti]}:
+                elapsed = time.time() - t0
                 status = "MATCH" if is_match else "MISS"
                 delta_show = f"{delta_cuda:.5f}" if math.isfinite(delta_cuda) else str(delta_cuda)
                 ref_show = f"{delta_ref:.5f}" if delta_ref is not None else "N/A"
-                method_tag = f"[{delta_method}]"
-                print(f"  [{pi+1:>5}/{len(records)}] {status} "
+                n_src = sum(1 for t in tasks if (t['a'], t['b']) == pcf_key)
+                print(f"  [{ti+1:>5}/{len(tasks)}] {status} "
                       f"δ_cuda={delta_show:>10} δ_ref={ref_show:>10} "
-                      f"diff={diff:.6f} {method_tag} K={K_use} est={est:.8f} "
-                      f"({elapsed:.1f}s) {len(sources)}src a={a_str[:40]}")
-
-            except Exception as e:
-                n_error += len(sources)
-                print(f"  [{pi+1:>5}/{len(records)}] ERROR walk: {e} | a={a_str}")
-                for si, src in enumerate(sources):
-                    writer.writerow({
-                        'pcf_idx': pi, 'source_idx': si,
-                        'a': a_str, 'b': b_str, 'limit': limit_str,
-                        'trajectory': str(src[0]) if src and isinstance(src, list) else '',
-                        'shift': str(src[1]) if src and isinstance(src, list) and len(src) > 1 else '',
-                        'delta_ref_cpu': delta_ref, 'convergence_rate_ref': conv_rate,
-                        'delta_cuda_rns': 'ERROR', 'est_float': '',
-                        'delta_diff': '', 'match': 'ERROR',
-                        'p_bits': '', 'depth': args.depth, 'K': args.K,
-                    })
+                      f"[{delta_method}] K={K_use} est={est:.8f} "
+                      f"({elapsed:.1f}s) {n_src}src a={a_str[:40]}")
 
     elapsed_total = time.time() - t_global
 
     # Summary
     print(f"\n{'='*90}")
     print(f"VERIFICATION COMPLETE")
-    print(f"  PCFs processed:   {len(records)}")
-    print(f"  Sources (rows):   {n_total}")
+    print(f"  Tasks processed:  {len(tasks)} ({n_unique_pcfs} unique PCFs)")
+    print(f"  Verified (rows):  {n_total}")
     print(f"  Matches:          {n_match}/{n_total} ({100*n_match/max(n_total,1):.1f}%)")
     print(f"  Skipped:          {n_skip}")
     print(f"  Errors:           {n_error}")
