@@ -49,6 +49,11 @@ def load_constants(dps: int = 200) -> List[Dict[str, Any]]:
     Returns list of dicts with 'name', 'value' (mpmath mpf), 'value_float',
     'sympy_expr', 'description'.
     """
+    import sys
+    # Python 3.11+ limits int→str conversion; high-dps mpmath needs large ints
+    if hasattr(sys, 'set_int_max_str_digits'):
+        sys.set_int_max_str_digits(max(sys.get_int_max_str_digits(), dps * 4))
+
     import sympy as sp
     import mpmath as mp
     mp.mp.dps = dps

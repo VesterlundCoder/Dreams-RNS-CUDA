@@ -147,8 +147,11 @@ def _lcm(a, b):
     return a * b // gcd(a, b)
 
 
-def run_odd_zeta_walk(sympy_matrix, depth: int, K: int, shift: int, n: int):
+def run_odd_zeta_walk(sympy_matrix, depth: int, K: int, shift: int, n: int,
+                      trajectory: int = 1):
     """Denominator-cleared RNS integer walk for odd-zeta CMF.
+
+    Walk: k = shift, shift+traj, shift+2*traj, ...
 
     At each step k:
       1. Evaluate M(k) as exact sympy Rationals
@@ -192,7 +195,7 @@ def run_odd_zeta_walk(sympy_matrix, depth: int, K: int, shift: int, n: int):
     log_scale = 0.0
 
     for step in range(depth):
-        k_val = shift + step
+        k_val = shift + step * trajectory
 
         # Evaluate M(k_val) as exact sympy Rationals
         M_rat = sympy_matrix.subs(k_sym, k_val)
@@ -267,6 +270,8 @@ def main():
                         help="Walk depth (default 5000)")
     parser.add_argument("--shifts", type=int, default=512,
                         help="Number of shifts (k starts at 1, 2, ..., shifts)")
+    parser.add_argument("--trajectories", type=int, nargs='+', default=[1],
+                        help="Trajectory strides, e.g. --trajectories 1 2 3 5")
     parser.add_argument("--K", type=int, default=0,
                         help="RNS primes (0=auto per CMF, sized for depth)")
     parser.add_argument("--dps", type=int, default=200,
@@ -294,9 +299,12 @@ def main():
     if args.max_cmfs > 0:
         specs = specs[:args.max_cmfs]
 
+    n_tasks_per_cmf = args.shifts * len(args.trajectories)
     print(f"\nOdd-Zeta CMF Sweep — RNS walk (GPU-scalable)")
     print(f"  CMFs:    {len(specs)}")
     print(f"  Shifts:  {args.shifts}")
+    print(f"  Trajs:   {args.trajectories}")
+    print(f"  Tasks:   {n_tasks_per_cmf} per CMF")
     print(f"  Depth:   {args.depth}")
     print(f"  K:       {'auto' if args.K == 0 else args.K}")
     print(f"  Method:  denominator-cleared RNS + CRT + mpmath delta")
@@ -343,8 +351,10 @@ def main():
         best_hit = None
 
         for si in range(1, args.shifts + 1):
+          for traj in args.trajectories:
             try:
-                res = run_odd_zeta_walk(sympy_mat, args.depth, K_use, shift=si, n=n)
+                res = run_odd_zeta_walk(sympy_mat, args.depth, K_use, shift=si, n=n,
+                                        trajectory=traj)
 
                 # CRT reconstruction: p = numerator, q = denominator (both exact integers)
                 primes = [int(p) for p in res['primes']]
@@ -426,6 +436,7 @@ def main():
                     'zeta_val': zeta_val,
                     'rank': rank,
                     'shift': si,
+                    'trajectory': traj,
                     'depth': args.depth,
                     'est': est_float,
                     'best_const': best_const,
@@ -443,8 +454,8 @@ def main():
                     best_hit = result
 
             except Exception as e:
-                if si == 1:
-                    print(f"  WALK ERROR (shift={si}): {e}")
+                if si == 1 and traj == 1:
+                    print(f"  WALK ERROR (shift={si}, traj={traj}): {e}")
                     import traceback; traceback.print_exc()
                 continue
 
@@ -456,9 +467,10 @@ def main():
         n_valid = len(cmf_results)
 
         if best_hit:
-            print(f"  {n_valid}/{args.shifts} walks OK, {n_positive} with δ>0, {n_good} with ≥6 digits")
+            print(f"  {n_valid}/{n_tasks_per_cmf} walks OK, {n_positive} with δ>0, {n_good} with ≥6 digits")
             print(f"  Best: δ={best_hit['best_delta']:.6f} → {best_hit['best_const']} "
                   f"({best_hit['match_digits']} digits, shift={best_hit['shift']}, "
+                  f"traj={best_hit['trajectory']}, "
                   f"crt_ok={best_hit['crt_ok']}, est={best_hit['est']:.12f})")
         else:
             print(f"  No valid results")
@@ -514,8 +526,8 @@ def main():
     print(f"  CRT valid:   {sum(1 for r in all_results if r['crt_ok'] == 'True')}/{len(all_results)}")
     print(f"  Results:     {results_path}")
     print(f"  Summary:     {summary_path}")
-    print(f"\n  Interesting hits? Run deep analysis:")
-    print(f"    python odd_zeta_exact.py --specs {args.specs} --depth 10000 --shifts 1")
+    print(f"\n  Interesting hits? Run deep CPU analysis:")
+    print(f"    python odd_zeta_exact.py --specs {args.specs} --depth 10000 --shifts 1 2 3 --trajectories 1 2 3")
 
 
 if __name__ == "__main__":

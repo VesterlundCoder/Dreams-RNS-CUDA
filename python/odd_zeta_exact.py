@@ -115,12 +115,15 @@ def run_odd_zeta_walk_exact(
     depth: int,
     shift: int,
     n: int,
+    trajectory: int = 1,
     progress_every: int = 200,
 ) -> Tuple[int, int, int]:
     """Exact big-integer walk for odd-zeta CMF.
 
     Uses denominator clearing + pure Python big integers.
     NO RNS, NO float, NO approximation.  Result is exact.
+
+    Walk: k = shift, shift+traj, shift+2*traj, ..., shift+(depth-1)*traj
 
     At each step k:
       1. Evaluate M(k) as exact sympy Rationals
@@ -161,7 +164,7 @@ def run_odd_zeta_walk_exact(
     t0 = time.time()
 
     for step in range(depth):
-        k_val = shift + step
+        k_val = shift + step * trajectory
 
         # Evaluate each non-zero entry as exact Rational, find common denom
         D_k = 1
@@ -246,8 +249,10 @@ def main():
                         help="CMF specs JSONL from odd_zeta_cmf_generator.py")
     parser.add_argument("--depth", type=int, default=5000,
                         help="Walk depth (default 5000 for deep exploration)")
-    parser.add_argument("--shifts", type=int, default=3,
-                        help="Number of shifts (k starts at 1, 2, ..., shifts)")
+    parser.add_argument("--shifts", type=int, nargs='+', default=[1, 2, 3],
+                        help="Shift values (starting k), e.g. --shifts 1 2 3 5 10")
+    parser.add_argument("--trajectories", type=int, nargs='+', default=[1],
+                        help="Trajectory strides, e.g. --trajectories 1 2 3 5")
     parser.add_argument("--dps", type=int, default=0,
                         help="mpmath decimal precision (0 = auto from depth)")
     parser.add_argument("--max-cmfs", type=int, default=0,
@@ -280,9 +285,12 @@ def main():
     if args.max_cmfs > 0:
         specs = specs[:args.max_cmfs]
 
+    n_tasks_per_cmf = len(args.shifts) * len(args.trajectories)
     print(f"\nOdd-Zeta CMF Deep Analysis — EXACT big-integer arithmetic")
     print(f"  CMFs:     {len(specs)}")
     print(f"  Shifts:   {args.shifts}")
+    print(f"  Trajs:    {args.trajectories}")
+    print(f"  Tasks:    {n_tasks_per_cmf} per CMF ({len(specs) * n_tasks_per_cmf} total)")
     print(f"  Depth:    {args.depth}")
     print(f"  mpmath:   {args.dps} decimal places")
     print(f"  Method:   denominator-cleared integer walk (no float, no RNS)")
@@ -311,14 +319,16 @@ def main():
             continue
 
         cmf_results = []
+        tasks = [(s, t) for s in args.shifts for t in args.trajectories]
 
-        for si in range(1, args.shifts + 1):
-            print(f"\n  ── Shift {si} ──")
+        for ti, (si, traj) in enumerate(tasks):
+            print(f"\n  ── Task {ti+1}/{len(tasks)}: shift={si}, trajectory={traj} ──")
             t0 = time.time()
 
             try:
                 p_big, q_big, total_bits = run_odd_zeta_walk_exact(
                     sympy_mat, args.depth, shift=si, n=n,
+                    trajectory=traj,
                     progress_every=max(args.depth // 10, 100),
                 )
             except Exception as e:
@@ -374,6 +384,7 @@ def main():
                 'rank': rank,
                 'n': n,
                 'shift': si,
+                'trajectory': traj,
                 'depth': args.depth,
                 'ratio': str(ratio_str),
                 'best_const': best_const,
