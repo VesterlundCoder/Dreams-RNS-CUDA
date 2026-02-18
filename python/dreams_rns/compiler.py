@@ -102,7 +102,7 @@ class CmfCompiler:
         program = compiler.build()
     """
     
-    MAX_REGS = 64
+    MAX_REGS = 512
     
     def __init__(self, m: int, dim: int, directions: Optional[List[int]] = None):
         self.m = m
@@ -271,9 +271,14 @@ class CmfCompiler:
     
     def compile_matrix_entry(self, row: int, col: int, expr, 
                              axis_symbols: Dict[str, int]):
-        """Compile a matrix entry expression and store it."""
+        """Compile a matrix entry expression and store it.
+
+        Resets the register counter after STORE so that subsequent
+        entries can reuse registers (STORE already captured the value).
+        """
         reg = self.compile_sympy_expr(expr, axis_symbols)
         self.store(reg, row, col)
+        self.next_reg = 0  # reclaim — STORE saved the result
     
     def build(self) -> CmfProgram:
         """Build the final program."""

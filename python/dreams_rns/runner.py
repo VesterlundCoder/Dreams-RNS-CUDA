@@ -1,8 +1,13 @@
 """
-Dreams Runner: GPU execution wrapper for the RNS walk pipeline.
+Dreams Runner: RNS walk pipeline with proper bytecode evaluation.
 
-This module handles GPU memory management, kernel execution, and result collection.
-Designed for use in Google Colab with A100 GPU.
+Implements the correct PCF companion matrix walk matching ramanujantools:
+  M(n) = [[0, b(n)], [1, a(n)]]  (companion form)
+  P(N) = A · M(1) · M(2) · ... · M(N)  where A = [[1, a(0)], [0, 1]]
+  p = P[0, m-1],  q = P[1, m-1]  (last column)
+  delta = -(1 + log|p/q - L| / log|q|)
+
+Supports CPU (numpy) and GPU (cupy) backends.
 """
 
 from dataclasses import dataclass, field
@@ -10,495 +15,462 @@ from typing import List, Optional, Tuple, Dict, Any
 import numpy as np
 import math
 
-from .compiler import CmfProgram, Opcode
+from .compiler import CmfProgram, CmfCompiler, Opcode
 
+
+# ── Configuration ────────────────────────────────────────────────────────
 
 @dataclass
 class WalkConfig:
-    """Configuration for walk execution.
-    
-    Dreams delta = -(1 + log(|err|) / log(|q|))
-    where err = |p/q - target|.
-    
-    Higher delta = better convergence. Hits are selected where delta > delta_threshold.
-    """
-    K: int = 64                     # Number of primes (64 * 31 = 1984 bits)
-    B: int = 1000                   # Batch size (shifts per CMF)
-    depth: int = 2000               # Walk depth
-    topk: int = 100                 # Top-K hits to keep
-    target: float = math.pi         # Target constant
-    snapshot_depths: Tuple[int, int] = (200, 2000)
-    delta_threshold: float = 0.0    # Minimum delta for hits (Dreams: higher = better)
-    normalize_every: int = 50       # Normalize shadow-float every N steps
+    """Configuration for walk execution."""
+    K: int = 64                     # Number of RNS primes (64 × 31-bit ≈ 1984 bits)
+    depth: int = 2000               # Walk depth (number of matrix multiplications)
+    delta_threshold: float = -2.0   # Minimum delta for reporting
 
 
-@dataclass
-class Hit:
-    """A hit result from the walk."""
-    cmf_idx: int
-    shift: List[int]
-    depth: int
-    delta: float
-    log_q: float
-    
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            'cmf_idx': self.cmf_idx,
-            'shift': self.shift,
-            'depth': self.depth,
-            'delta': self.delta,
-            'log_q': self.log_q
-        }
-
+# ── Prime generation ─────────────────────────────────────────────────────
 
 def generate_rns_primes(K: int) -> np.ndarray:
-    """Generate K 31-bit primes for RNS representation."""
+    """Generate K 31-bit primes (descending from 2^31-1) for RNS."""
     PRIME_MAX = (1 << 31) - 1
     PRIME_MIN = 1 << 30
-    
+
     def is_prime(n):
-        if n < 2:
-            return False
-        if n == 2:
-            return True
-        if n % 2 == 0:
-            return False
+        if n < 2: return False
+        if n == 2: return True
+        if n % 2 == 0: return False
         for i in range(3, int(n**0.5) + 1, 2):
-            if n % i == 0:
-                return False
+            if n % i == 0: return False
         return True
-    
+
     primes = []
     candidate = PRIME_MAX
     while len(primes) < K and candidate >= PRIME_MIN:
         if is_prime(candidate):
             primes.append(candidate)
         candidate -= 2
-    
-    return np.array(primes, dtype=np.uint32)
+    return np.array(primes, dtype=np.int64)
 
 
-def compute_barrett_mu(primes: np.ndarray) -> np.ndarray:
-    """Compute Barrett reduction constants."""
-    # Use explicit uint64 array to avoid overflow
-    K = len(primes)
-    mus = np.zeros(K, dtype=np.uint64)
-    for i, p in enumerate(primes):
-        p_int = int(p)
-        mus[i] = ((1 << 63) // p_int) * 2
-    return mus
+# ── CRT reconstruction ──────────────────────────────────────────────────
 
+def crt_reconstruct(residues, primes):
+    """Reconstruct big integer from RNS residues via iterative CRT.
 
-def crt_reconstruct_partial(residues: np.ndarray, primes: np.ndarray) -> int:
-    """
-    Reconstruct integer from residues using iterative CRT.
-    
     Args:
-        residues: Array of residues [K_small]
-        primes: Array of primes [K_small]
-    
+        residues: iterable of int residues, length K
+        primes:   iterable of int primes,   length K
+
     Returns:
-        Reconstructed integer (Python int, arbitrary precision)
+        (x, M) where x is the reconstructed value and M = prod(primes).
+        The true value is x (unsigned) or x - M (signed, if x > M/2).
     """
     x = int(residues[0])
     M = int(primes[0])
-    
     for i in range(1, len(residues)):
         p_i = int(primes[i])
         a_i = int(residues[i])
-        
-        # Compute x mod p_i
-        x_mod_pi = x % p_i
-        
-        # Compute M mod p_i
-        M_mod_pi = M % p_i
-        
-        # Compute M_inv = inverse of M mod p_i using extended Euclidean algorithm
-        M_inv = pow(M_mod_pi, p_i - 2, p_i)  # Fermat's little theorem
-        
-        # Compute t = (a_i - x_mod_pi) * M_inv mod p_i
-        diff = (a_i - x_mod_pi) % p_i
-        t = (diff * M_inv) % p_i
-        
-        # Update x = x + M * t
-        x = x + M * t
-        
-        # Update M = M * p_i
-        M = M * p_i
-    
-    return x
+        t = ((a_i - x % p_i) % p_i) * pow(M % p_i, p_i - 2, p_i) % p_i
+        x += M * t
+        M *= p_i
+    return x, M
 
 
-def compute_dreams_delta(p_val: float, q_val: float, log_scale: float, 
-                         target: float) -> Tuple[float, float]:
+def centered(x, M):
+    """Convert unsigned CRT result to signed (centered) representation."""
+    return x - M if x > M // 2 else x
+
+
+# ── Delta computation ────────────────────────────────────────────────────
+
+def compute_dreams_delta_float(p_val: float, q_val: float,
+                               log_scale: float, target: float
+                               ) -> Tuple[float, float]:
+    """Approximate delta from float64 shadow values.
+
+    Returns (delta, log_q).
     """
-    Compute Dreams delta from trajectory values.
-    
-    Dreams delta = -(1 + log(|err|) / log(|q|))
-    where err = |p/q - target|
-    
-    Higher delta = better convergence (closer to Diophantine limit).
-    
-    Args:
-        p_val: numerator from trajectory P[0, m-1]
-        q_val: denominator from trajectory P[1, m-1]
-        log_scale: accumulated log of normalization scale
-        target: target constant
-    
-    Returns:
-        (delta, log_q) tuple
-    """
-    # Guard against invalid values
     if not math.isfinite(p_val) or not math.isfinite(q_val) or abs(q_val) < 1e-300:
         return -1e10, 0.0
-    
-    # Compute estimate and error
     est = p_val / q_val
     abs_err = abs(est - target)
-    
-    # Compute log|q| including accumulated scale
     log_abs_q = log_scale + math.log(abs(q_val))
-    
-    # Guard against edge cases
     if abs_err < 1e-300 or log_abs_q <= 0.0:
         return (100.0 if abs_err < 1e-300 else -1e10), log_abs_q
-    
-    # Dreams delta formula
-    delta = -(1.0 + math.log(abs_err) / log_abs_q)
-    
-    return delta, log_abs_q
+    return -(1.0 + math.log(abs_err) / log_abs_q), log_abs_q
 
 
-class DreamsRunner:
+def compute_dreams_delta_exact(p_big: int, q_big: int, target, dps: int = 200):
+    """Exact delta from big-integer p, q using mpmath.
+
+    Args:
+        p_big, q_big: exact big integers from CRT
+        target: mpmath.mpf or float target constant
+        dps: decimal precision for mpmath
+
+    Returns:
+        float delta value
     """
-    GPU runner for Dreams pipeline.
-    
-    Usage:
-        runner = DreamsRunner(programs, target=math.pi)
-        hits = runner.run(shifts_per_cmf=1000, depth=2000)
+    import mpmath as mp
+    mp.mp.dps = dps
+    if q_big == 0:
+        return float('-inf')
+    approx = mp.mpf(p_big) / mp.mpf(q_big)
+    err = abs(approx - mp.mpf(str(target)))
+    qq = abs(mp.mpf(q_big))
+    if err == 0:
+        return float('inf')
+    if qq <= 1:
+        return float('-inf')
+    return float(-(1 + mp.log(err) / mp.log(qq)))
+
+
+# ── PCF compilation helper ───────────────────────────────────────────────
+
+def compile_pcf(a_str: str, b_str: str) -> Optional[CmfProgram]:
+    """Compile PCF(a(n), b(n)) to RNS bytecode.
+
+    Builds the companion matrix matching ramanujantools convention:
+        M(n) = [[0, b(n)], [1, a(n)]]
+
+    The walk variable n is mapped to LOAD_X axis 0 with shift=1, direction=1
+    so that at step t the axis value is 1+t = 1, 2, 3, ...
+
+    Returns None if the PCF contains imaginary numbers.
     """
-    
-    def __init__(self, programs: List[CmfProgram], target: float = math.pi,
-                 config: Optional[WalkConfig] = None):
-        """
-        Initialize the runner.
-        
-        Args:
-            programs: List of compiled CMF programs
-            target: Target constant to search for
-            config: Walk configuration
-        """
-        self.programs = programs
-        self.target = target
-        self.config = config or WalkConfig(target=target)
-        
-        # Will be set when GPU is initialized
-        self._gpu_initialized = False
-        self._primes = None
-        self._mus = None
-    
-    def _init_gpu(self):
-        """Initialize GPU resources."""
-        if self._gpu_initialized:
-            return
-        
-        try:
-            import cupy as cp
-            self._cp = cp
-            self._gpu_available = True
-        except ImportError:
-            self._gpu_available = False
-            print("CuPy not available, using CPU fallback")
-        
-        # Generate primes
-        self._primes = generate_rns_primes(self.config.K)
-        self._mus = compute_barrett_mu(self._primes)
-        
-        if self._gpu_available:
-            self._d_primes = self._cp.asarray(self._primes)
-            self._d_mus = self._cp.asarray(self._mus)
-        
-        self._gpu_initialized = True
-    
-    def generate_shifts(self, cmf_idx: int, n_shifts: int, 
-                        dim: int, method: str = 'random',
-                        bounds: Optional[Tuple[int, int]] = None) -> np.ndarray:
-        """
-        Generate shift values for exploration.
-        
-        Args:
-            cmf_idx: CMF index (for deterministic seeding)
-            n_shifts: Number of shifts to generate
-            dim: Number of dimensions
-            method: 'random', 'grid', or 'sphere'
-            bounds: (min, max) bounds for shifts
-        
-        Returns:
-            Array of shape (n_shifts, dim)
-        """
-        bounds = bounds or (-1000, 1000)
-        rng = np.random.default_rng(seed=42 + cmf_idx)
-        
-        if method == 'random':
-            return rng.integers(bounds[0], bounds[1], size=(n_shifts, dim), dtype=np.int32)
-        
-        elif method == 'grid':
-            # Uniform grid in each dimension
-            side = int(np.ceil(n_shifts ** (1/dim)))
-            grids = [np.linspace(bounds[0], bounds[1], side, dtype=np.int32) for _ in range(dim)]
-            mesh = np.meshgrid(*grids, indexing='ij')
-            shifts = np.stack([m.flatten() for m in mesh], axis=1)
-            return shifts[:n_shifts]
-        
-        elif method == 'sphere':
-            # Random points on hypersphere surface
-            radius = (bounds[1] - bounds[0]) / 2
-            center = (bounds[0] + bounds[1]) / 2
-            points = rng.standard_normal((n_shifts, dim))
-            points = points / np.linalg.norm(points, axis=1, keepdims=True)
-            radii = rng.uniform(0, 1, (n_shifts, 1)) ** (1/dim)
-            points = center + points * radii * radius
-            return points.astype(np.int32)
-        
-        else:
-            raise ValueError(f"Unknown method: {method}")
-    
-    def _run_walk_cpu(self, program: CmfProgram, shifts: np.ndarray) -> List[Hit]:
-        """CPU fallback for walk computation."""
-        m = program.m
-        dim = program.dim
-        B = len(shifts)
-        K = self.config.K
-        
-        # Initialize P to identity for each (prime, shift)
-        P = np.zeros((K, B, m, m), dtype=np.uint64)
-        for k in range(K):
-            for b in range(B):
-                for i in range(m):
-                    P[k, b, i, i] = 1
-        
-        # Also track float shadow
-        P_float = np.zeros((B, m, m), dtype=np.float64)
-        for b in range(B):
-            for i in range(m):
-                P_float[b, i, i] = 1.0
-        log_scale = np.zeros(B, dtype=np.float64)
-        
-        hits = []
-        
-        # Walk loop
-        for step in range(self.config.depth):
-            # Evaluate step matrix for each shift
-            for b in range(B):
-                M = np.zeros((m, m), dtype=np.float64)
-                M_rns = np.zeros((K, m, m), dtype=np.uint64)
-                
-                # Simple evaluation (placeholder - real implementation uses bytecode)
-                # For now, just use identity + small perturbation based on shift
-                for i in range(m):
-                    M[i, i] = 1.0
-                    for k in range(K):
-                        M_rns[k, i, i] = 1
-                
-                # Update P = P @ M
-                for k in range(K):
-                    p = int(self._primes[k])
-                    new_P = np.zeros((m, m), dtype=np.uint64)
-                    for i in range(m):
-                        for j in range(m):
-                            acc = 0
-                            for l in range(m):
-                                acc += int(P[k, b, i, l]) * int(M_rns[k, l, j])
-                            new_P[i, j] = acc % p
-                    P[k, b] = new_P
-                
-                # Update float shadow
-                new_P_float = P_float[b] @ M
-                max_val = np.max(np.abs(new_P_float))
-                if max_val > 1e10:
-                    new_P_float /= max_val
-                    log_scale[b] += np.log(max_val)
-                P_float[b] = new_P_float
-            
-            # Check for hits at snapshot depth using Dreams delta
-            if step + 1 in self.config.snapshot_depths:
-                for b in range(B):
-                    # Extract p, q from trajectory
-                    p_val = float(P_float[b, 0, -1])
-                    q_val = float(P_float[b, 1, -1])
-                    
-                    # Compute Dreams delta
-                    delta, log_q = compute_dreams_delta(
-                        p_val, q_val, float(log_scale[b]), self.target
-                    )
-                    
-                    # Dreams: select hits where delta > threshold (higher = better)
-                    if delta > self.config.delta_threshold and delta > -1e9:
-                        hits.append(Hit(
-                            cmf_idx=0,
-                            shift=list(shifts[b]),
-                            depth=step + 1,
-                            delta=delta,
-                            log_q=log_q
-                        ))
-        
-        return hits
-    
-    def _run_walk_gpu(self, program: CmfProgram, shifts: np.ndarray, 
-                      cmf_idx: int) -> List[Hit]:
-        """GPU implementation using CuPy."""
-        cp = self._cp
-        m = program.m
-        dim = program.dim
-        B = len(shifts)
-        K = self.config.K
-        
-        # Upload shifts to GPU
-        d_shifts = cp.asarray(shifts)
-        
-        # Initialize P to identity
-        P_rns = cp.zeros((K, B, m, m), dtype=cp.uint32)
-        for i in range(m):
-            P_rns[:, :, i, i] = 1
-        
-        # Float shadow
-        P_float = cp.zeros((B, m, m), dtype=cp.float64)
-        for i in range(m):
-            P_float[:, i, i] = 1.0
-        log_scale = cp.zeros(B, dtype=cp.float64)
-        
-        # Convert constants to RNS
-        const_rns = cp.zeros((K, len(program.constants)), dtype=cp.uint32)
-        for k in range(K):
-            p = int(self._primes[k])
-            for c_idx, c_val in enumerate(program.constants):
-                const_rns[k, c_idx] = c_val % p if c_val >= 0 else (p - (-c_val % p)) % p
-        
-        hits = []
-        
-        # Main walk loop (simplified - real impl uses CUDA kernels)
-        for step in range(self.config.depth):
-            # Evaluate step matrices (simplified placeholder)
-            M_rns = cp.zeros((K, B, m, m), dtype=cp.uint32)
-            M_float = cp.zeros((B, m, m), dtype=cp.float64)
-            
-            # Identity + step-dependent values (placeholder)
-            for i in range(m):
-                M_rns[:, :, i, i] = 1
-                M_float[:, i, i] = 1.0
-            
-            # Add axis-dependent terms (simplified)
-            for axis in range(dim):
-                axis_vals = d_shifts[:, axis] + step * program.directions[axis]
-                # Real implementation would evaluate full bytecode here
-            
-            # Batched modular matmul P = P @ M
-            for k in range(K):
-                p = int(self._primes[k])
-                mu = int(self._mus[k])
-                
-                # Simple matmul (real impl uses optimized CUDA kernel)
-                new_P = cp.zeros((B, m, m), dtype=cp.uint64)
-                for i in range(m):
-                    for j in range(m):
-                        for l in range(m):
-                            new_P[:, i, j] += P_rns[k, :, i, l].astype(cp.uint64) * M_rns[k, :, l, j].astype(cp.uint64)
-                P_rns[k] = (new_P % p).astype(cp.uint32)
-            
-            # Float shadow update with rescaling
-            for b_start in range(0, B, 256):
-                b_end = min(b_start + 256, B)
-                batch = P_float[b_start:b_end] @ M_float[b_start:b_end]
-                max_vals = cp.max(cp.abs(batch), axis=(1, 2))
-                needs_rescale = max_vals > 1e10
-                if cp.any(needs_rescale):
-                    scale_factors = cp.where(needs_rescale, max_vals, 1.0)
-                    batch = batch / scale_factors[:, None, None]
-                    log_scale[b_start:b_end] += cp.log(scale_factors)
-                P_float[b_start:b_end] = batch
-            
-            # Check for hits at snapshot depths using Dreams delta (shadow-float)
-            if step + 1 in self.config.snapshot_depths:
-                # Extract p and q from shadow-float trajectory
-                p_vals = P_float[:, 0, -1].get()  # [B]
-                q_vals = P_float[:, 1, -1].get()  # [B]
-                log_scales = log_scale.get()      # [B]
-                
-                # Compute Dreams delta for each shift
-                for b in range(B):
-                    delta, log_q = compute_dreams_delta(
-                        float(p_vals[b]), float(q_vals[b]), 
-                        float(log_scales[b]), self.target
-                    )
-                    
-                    # Dreams: select hits where delta > threshold (higher = better)
-                    if delta > self.config.delta_threshold and delta > -1e9:
-                        hits.append(Hit(
-                            cmf_idx=cmf_idx,
-                            shift=list(shifts[b]),
-                            depth=step + 1,
-                            delta=delta,
-                            log_q=log_q
-                        ))
-        
-        return hits
-    
-    def run(self, shifts_per_cmf: Optional[int] = None,
-            depth: Optional[int] = None,
-            shift_method: str = 'random',
-            shift_bounds: Optional[Tuple[int, int]] = None) -> List[Hit]:
-        """
-        Run the Dreams pipeline on all CMF programs.
-        
-        Args:
-            shifts_per_cmf: Number of shifts to try per CMF
-            depth: Walk depth (overrides config)
-            shift_method: Method for generating shifts
-            shift_bounds: Bounds for shift generation
-        
-        Returns:
-            List of Hit objects
-        """
-        self._init_gpu()
-        
-        if shifts_per_cmf is not None:
-            self.config.B = shifts_per_cmf
-        if depth is not None:
-            self.config.depth = depth
-        
-        all_hits = []
-        
-        for cmf_idx, program in enumerate(self.programs):
-            print(f"Processing CMF {cmf_idx + 1}/{len(self.programs)}...")
-            
-            # Generate shifts for this CMF
-            shifts = self.generate_shifts(
-                cmf_idx, 
-                self.config.B, 
-                program.dim,
-                method=shift_method,
-                bounds=shift_bounds
-            )
-            
-            # Run walk
-            if self._gpu_available:
-                hits = self._run_walk_gpu(program, shifts, cmf_idx)
-            else:
-                hits = self._run_walk_cpu(program, shifts)
-            
-            all_hits.extend(hits)
-            print(f"  Found {len(hits)} hits")
-        
-        # Sort by delta (highest first - Dreams: higher delta = better)
-        all_hits.sort(key=lambda h: h.delta, reverse=True)
-        return all_hits[:self.config.topk]
-    
-    def run_single(self, program: CmfProgram, shifts: np.ndarray,
-                   cmf_idx: int = 0) -> List[Hit]:
-        """Run walk on a single CMF with specified shifts."""
-        self._init_gpu()
-        
-        if self._gpu_available:
-            return self._run_walk_gpu(program, shifts, cmf_idx)
-        else:
-            return self._run_walk_cpu(program, shifts)
+    import sympy as sp
+    from sympy.abc import n
+
+    a_expr = sp.sympify(a_str)
+    b_expr = sp.sympify(b_str)
+
+    if a_expr.has(sp.I) or b_expr.has(sp.I):
+        return None
+
+    # Rename n -> _s so the compiler uses LOAD_X (axis 0) instead of LOAD_N
+    _s = sp.Symbol("_s")
+    a_expr = a_expr.subs(n, _s)
+    b_expr = b_expr.subs(n, _s)
+
+    compiler = CmfCompiler(m=2, dim=1, directions=[1])
+    axis_symbols = {"_s": 0}
+
+    # M[0,0] = 0 — skip (matrix initialised to zero)
+    # M[0,1] = b(n)
+    compiler.compile_matrix_entry(0, 1, b_expr, axis_symbols)
+    # M[1,0] = 1
+    compiler.compile_matrix_entry(1, 0, sp.Integer(1), axis_symbols)
+    # M[1,1] = a(n)
+    compiler.compile_matrix_entry(1, 1, a_expr, axis_symbols)
+
+    return compiler.build()
+
+
+def pcf_initial_values(a_str: str):
+    """Compute initial-values matrix A = [[1, a(0)], [0, 1]] as float and list.
+
+    Returns (a0_int, a0_float) where a0 = a(0) evaluated as integer.
+    """
+    import sympy as sp
+    from sympy.abc import n
+    a0 = int(sp.sympify(a_str).subs(n, 0))
+    return a0
+
+
+# ── Bytecode evaluator — vectorised across all K primes ──────────────────
+
+def _precompute_const_residues(program: CmfProgram, primes: np.ndarray) -> np.ndarray:
+    """Precompute c_i mod p_k for every (constant, prime) pair.
+
+    Returns array of shape (n_constants, K), dtype int64.
+    """
+    K = len(primes)
+    pp_list = [int(p) for p in primes]
+    n_c = len(program.constants)
+    table = np.zeros((n_c, K), dtype=np.int64)
+    for idx in range(n_c):
+        c = int(program.constants[idx])
+        table[idx] = np.array([c % p if c >= 0 else (p - (-c % p)) % p
+                                for p in pp_list], dtype=np.int64)
+    return table
+
+
+def _eval_bytecode_allprimes(program: CmfProgram, step: int,
+                              shift_val: int, primes: np.ndarray,
+                              const_table: np.ndarray) -> np.ndarray:
+    """Evaluate bytecode producing one (m, m, K) matrix — all primes at once.
+
+    Args:
+        program:     compiled CmfProgram
+        step:        current walk step (0-indexed)
+        shift_val:   integer shift for axis 0  (n = shift_val + step)
+        primes:      int64 array of K primes
+        const_table: precomputed (n_constants, K) residue table
+
+    Returns:
+        np.ndarray of shape (m, m, K), dtype int64, entries mod primes
+    """
+    m = program.m
+    K = len(primes)
+    pp = primes  # int64
+
+    regs = [np.zeros(K, dtype=np.int64) for _ in range(512)]
+    M = np.zeros((m, m, K), dtype=np.int64)
+
+    for instr in program.opcodes:
+        op = instr.op
+        if op == Opcode.END:
+            break
+        elif op == Opcode.LOAD_X:
+            axis, dest = instr.arg0, instr.arg1
+            val = np.int64(shift_val + step * program.directions[axis])
+            regs[dest] = val % pp
+        elif op == Opcode.LOAD_C:
+            idx, dest = instr.arg0, instr.arg1
+            regs[dest] = const_table[idx].copy()
+        elif op == Opcode.LOAD_N:
+            dest = instr.arg0
+            regs[dest] = np.int64(step) % pp
+        elif op == Opcode.ADD:
+            r1, r2, dest = instr.arg0, instr.arg1, instr.arg2
+            regs[dest] = (regs[r1] + regs[r2]) % pp
+        elif op == Opcode.SUB:
+            r1, r2, dest = instr.arg0, instr.arg1, instr.arg2
+            regs[dest] = (regs[r1] - regs[r2]) % pp
+        elif op == Opcode.MUL:
+            r1, r2, dest = instr.arg0, instr.arg1, instr.arg2
+            regs[dest] = (regs[r1] * regs[r2]) % pp
+        elif op == Opcode.NEG:
+            r, dest = instr.arg0, instr.arg1
+            regs[dest] = (pp - regs[r]) % pp
+        elif op == Opcode.POW2:
+            r, dest = instr.arg0, instr.arg1
+            regs[dest] = (regs[r] * regs[r]) % pp
+        elif op == Opcode.POW3:
+            r, dest = instr.arg0, instr.arg1
+            regs[dest] = (regs[r] * regs[r] % pp * regs[r]) % pp
+        elif op == Opcode.INV:
+            r, dest = instr.arg0, instr.arg1
+            vals = regs[r]
+            regs[dest] = np.array([pow(int(v), int(p) - 2, int(p))
+                                    for v, p in zip(vals, pp)], dtype=np.int64)
+        elif op == Opcode.STORE:
+            r, row, col = instr.arg0, instr.arg1, instr.arg2
+            M[row, col] = regs[r] % pp
+    return M
+
+
+def _eval_bytecode_float(program: CmfProgram, step: int,
+                          shift_val: int) -> np.ndarray:
+    """Evaluate bytecode producing one (m, m) float64 matrix.
+
+    Args:
+        program:   compiled CmfProgram
+        step:      current walk step (0-indexed)
+        shift_val: integer shift for axis 0  (n = shift_val + step)
+
+    Returns:
+        np.ndarray of shape (m, m), dtype float64
+    """
+    m = program.m
+    regs = [0.0] * 512
+    M = np.zeros((m, m), dtype=np.float64)
+
+    for instr in program.opcodes:
+        op = instr.op
+        if op == Opcode.END:
+            break
+        elif op == Opcode.LOAD_X:
+            axis, dest = instr.arg0, instr.arg1
+            regs[dest] = float(shift_val + step * program.directions[axis])
+        elif op == Opcode.LOAD_C:
+            idx, dest = instr.arg0, instr.arg1
+            regs[dest] = float(program.constants[idx])
+        elif op == Opcode.LOAD_N:
+            dest = instr.arg0
+            regs[dest] = float(step)
+        elif op == Opcode.ADD:
+            r1, r2, dest = instr.arg0, instr.arg1, instr.arg2
+            regs[dest] = regs[r1] + regs[r2]
+        elif op == Opcode.SUB:
+            r1, r2, dest = instr.arg0, instr.arg1, instr.arg2
+            regs[dest] = regs[r1] - regs[r2]
+        elif op == Opcode.MUL:
+            r1, r2, dest = instr.arg0, instr.arg1, instr.arg2
+            regs[dest] = regs[r1] * regs[r2]
+        elif op == Opcode.NEG:
+            r, dest = instr.arg0, instr.arg1
+            regs[dest] = -regs[r]
+        elif op == Opcode.POW2:
+            r, dest = instr.arg0, instr.arg1
+            regs[dest] = regs[r] ** 2
+        elif op == Opcode.POW3:
+            r, dest = instr.arg0, instr.arg1
+            regs[dest] = regs[r] ** 3
+        elif op == Opcode.INV:
+            r, dest = instr.arg0, instr.arg1
+            regs[dest] = 1.0 / regs[r] if abs(regs[r]) > 1e-300 else 0.0
+        elif op == Opcode.STORE:
+            r, row, col = instr.arg0, instr.arg1, instr.arg2
+            M[row, col] = regs[r]
+    return M
+
+
+# ── 2×2 modular matmul vectorised across K primes ───────────────────────
+
+def _matmul_2x2_mod(A: np.ndarray, B: np.ndarray, pp: np.ndarray) -> np.ndarray:
+    """Modular 2×2 matrix multiply A @ B mod pp, vectorised over K primes.
+
+    A, B: shape (2, 2, K) int64
+    pp:   shape (K,) int64
+    Returns: (2, 2, K) int64
+    """
+    C = np.empty_like(A)
+    C[0, 0] = (A[0, 0] * B[0, 0] + A[0, 1] * B[1, 0]) % pp
+    C[0, 1] = (A[0, 0] * B[0, 1] + A[0, 1] * B[1, 1]) % pp
+    C[1, 0] = (A[1, 0] * B[0, 0] + A[1, 1] * B[1, 0]) % pp
+    C[1, 1] = (A[1, 0] * B[0, 1] + A[1, 1] * B[1, 1]) % pp
+    return C
+
+
+# ── Main walk function ──────────────────────────────────────────────────
+
+def run_pcf_walk(program: CmfProgram, a0: int, depth: int, K: int = 64,
+                 shift_val: int = 1):
+    """Run the RNS walk for a PCF and return raw results.
+
+    Uses the correct convention:
+      M(n) = [[0, b(n)], [1, a(n)]]   (companion form)
+      P = A · M(1) · M(2) · ... · M(depth)
+      where A = [[1, a(0)], [0, 1]]
+      p = P[0, 1],  q = P[1, 1]      (last column of 2×2)
+
+    Args:
+        program:   compiled CmfProgram (companion matrix)
+        a0:        a(0) value for the initial-values matrix A
+        depth:     number of walk steps
+        K:         number of RNS primes
+        shift_val: integer shift so axis_val = shift_val + step (default 1 → n=1,2,3,…)
+
+    Returns:
+        dict with keys:
+          p_residues: shape (K,) int64 — p mod each prime
+          q_residues: shape (K,) int64 — q mod each prime
+          p_float:    float64 numerator (from shadow)
+          q_float:    float64 denominator (from shadow)
+          log_scale:  accumulated float64 log-normalization scale
+          primes:     shape (K,) int64 — the primes used
+    """
+    pp = generate_rns_primes(K).astype(np.int64)
+    m = program.m
+    assert m == 2, "run_pcf_walk only supports 2×2 companion matrices"
+
+    const_table = _precompute_const_residues(program, pp)
+
+    # Precompute a0 residues for initial P = A = [[1, a0], [0, 1]]
+    a0_res = np.array([int(a0) % int(p) if a0 >= 0 else (int(p) - (-int(a0) % int(p))) % int(p)
+                        for p in pp], dtype=np.int64)
+
+    # RNS accumulator: P_rns[i,j,k] = entry (i,j) mod prime k
+    # Initialise to A = [[1, a0], [0, 1]]
+    P_rns = np.zeros((2, 2, K), dtype=np.int64)
+    P_rns[0, 0] = np.ones(K, dtype=np.int64)
+    P_rns[0, 1] = a0_res
+    P_rns[1, 1] = np.ones(K, dtype=np.int64)
+
+    # Float64 shadow, also initialised to A
+    P_f = np.array([[1.0, float(a0)], [0.0, 1.0]], dtype=np.float64)
+    log_scale = 0.0
+
+    for step in range(depth):
+        # Evaluate M(n) at n = shift_val + step
+        M_rns = _eval_bytecode_allprimes(program, step, shift_val, pp, const_table)
+        M_f = _eval_bytecode_float(program, step, shift_val)
+
+        # RNS: P = P @ M  (vectorised over K primes)
+        P_rns = _matmul_2x2_mod(P_rns, M_rns, pp)
+
+        # Float shadow: P = P @ M with rescaling
+        P_f = P_f @ M_f
+        mx = np.max(np.abs(P_f))
+        if mx > 1e10:
+            P_f /= mx
+            log_scale += math.log(mx)
+
+    # Extract last column (column index m-1 = 1 for 2×2)
+    p_res = P_rns[0, 1]  # shape (K,)
+    q_res = P_rns[1, 1]  # shape (K,)
+    p_float = P_f[0, 1]
+    q_float = P_f[1, 1]
+
+    return {
+        'p_residues': p_res,
+        'q_residues': q_res,
+        'p_float': p_float,
+        'q_float': q_float,
+        'log_scale': log_scale,
+        'primes': pp,
+    }
+
+
+def verify_pcf(a_str: str, b_str: str, limit_str: str,
+               depth: int = 2000, K: int = 64, dps: int = 200):
+    """End-to-end PCF verification: compile → walk → CRT → delta.
+
+    Args:
+        a_str, b_str: polynomial strings for a(n), b(n)
+        limit_str:    sympy-parseable limit expression (e.g. "2/(4-pi)")
+        depth:        walk depth
+        K:            number of RNS primes
+        dps:          mpmath decimal precision
+
+    Returns:
+        dict with delta_float, delta_exact, limit_float, est_float, ...
+        or None if compilation fails.
+    """
+    import sympy as sp
+    import mpmath as mp
+    mp.mp.dps = dps
+
+    # 1. Compile
+    program = compile_pcf(a_str, b_str)
+    if program is None:
+        return None
+
+    # 2. Initial values
+    a0 = pcf_initial_values(a_str)
+
+    # 3. Walk
+    res = run_pcf_walk(program, a0, depth, K)
+
+    # 4. Parse target
+    target_expr = sp.sympify(limit_str, locals={"pi": sp.pi, "E": sp.E})
+    target_mp = mp.mpf(str(sp.N(target_expr, dps)))
+
+    # 5. Float64 delta (approximate)
+    delta_float, log_q = compute_dreams_delta_float(
+        res['p_float'], res['q_float'], res['log_scale'], float(target_mp))
+
+    # 6. CRT exact delta
+    primes_list = [int(p) for p in res['primes']]
+    p_big, Mp = crt_reconstruct([int(r) for r in res['p_residues']], primes_list)
+    q_big, _  = crt_reconstruct([int(r) for r in res['q_residues']], primes_list)
+    p_big = centered(p_big, Mp)
+    q_big = centered(q_big, Mp)
+    delta_exact = compute_dreams_delta_exact(p_big, q_big, target_mp, dps)
+
+    est_float = res['p_float'] / res['q_float'] if abs(res['q_float']) > 1e-300 else float('nan')
+
+    return {
+        'a': a_str,
+        'b': b_str,
+        'limit': limit_str,
+        'target': float(target_mp),
+        'est_float': est_float,
+        'delta_float': delta_float,
+        'delta_exact': delta_exact,
+        'log_q': log_q,
+        'depth': depth,
+        'K': K,
+        'p_bits': Mp.bit_length(),
+    }

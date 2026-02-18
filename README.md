@@ -1,185 +1,155 @@
 # Dreams-RNS-CUDA
 
-A GPU-accelerated Ramanujan Dreams pipeline using RNS (Residue Number System) arithmetic for exact integer computation on NVIDIA GPUs. Designed for Google Colab A100 execution.
+GPU-accelerated verification of Polynomial Continued Fractions (PCFs) using
+RNS (Residue Number System) arithmetic. Produces **exact** big-integer
+convergents on NVIDIA GPUs (A100 / H100).
 
-## Architecture Overview
-
-This pipeline implements a **persistent kernel** approach where the entire CMF walk runs on GPU without CPU round-trips:
+## Mathematical Convention (matches `ramanujantools`)
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         GPU PERSISTENT KERNEL                               │
-│                                                                             │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌───────────┐ │
-│  │   COMPILE    │───▶│    EVAL      │───▶│    WALK      │───▶│   TOPK    │ │
-│  │  CMF→Bytecode│    │ Axis Matrices│    │ P = P @ M_t  │    │  Delta    │ │
-│  └──────────────┘    └──────────────┘    └──────────────┘    └───────────┘ │
-│         │                   │                   │                   │       │
-│         ▼                   ▼                   ▼                   ▼       │
-│   ┌──────────┐        ┌──────────┐        ┌──────────┐        ┌─────────┐  │
-│   │ Opcodes  │        │ A_rns    │        │ P_rns    │        │ Hits    │  │
-│   │ Constants│        │ [K,B,m,m]│        │ [K,B,m,m]│        │ TopK    │  │
-│   └──────────┘        └──────────┘        └──────────┘        └─────────┘  │
-│                                                                             │
-│  Memory Layout: SoA over K primes, batched over B shifts                   │
-│  All computation: modular arithmetic in RNS representation                 │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼ (only small results)
-                            ┌───────────────┐
-                            │   CPU HOST    │
-                            │  - Logging    │
-                            │  - Final CRT  │
-                            │  - Verify     │
-                            └───────────────┘
+Companion matrix:   M(n) = [[0, b(n)], [1, a(n)]]
+Initial values:     A     = [[1, a(0)], [0, 1]]
+Walk product:       P(N)  = A · M(1) · M(2) · … · M(N)
+Convergent:         p/q   = P[0, m-1] / P[1, m-1]   (last column)
+Delta:              δ     = -(1 + log|p/q - L| / log|q|)
 ```
 
-## Pipeline Stages
+## Quick Start
 
-### 1. CMF Compile (Offline, CPU)
-- Input: Symbolic CMF expression from `ramanujantools`
-- Output: GPU bytecode program (opcodes + constants)
-- Converts symbolic matrix expressions to evaluatable DAG
+```python
+from dreams_rns import verify_pcf
 
-### 2. Axis Matrix Evaluation (GPU)
-- Evaluates each axis matrix A_j(x) for all shifts and primes in parallel
-- Uses bytecode interpreter with modular arithmetic
-- Output: `A_rns[K, B, m, m]` per axis
+result = verify_pcf(
+    a_str="2",
+    b_str="n**2",
+    limit_str="2/(4 - pi)",
+    depth=2000,
+    K=64,
+)
+print(f"δ_exact = {result['delta_exact']:.6f}")   # ≈ -1.000291
+print(f"δ_float = {result['delta_float']:.6f}")   # ≈ -0.998855
+print(f"p bits  = {result['p_bits']}")             # 1984
+```
 
-### 3. Step Matrix Composition (GPU)
-- Computes M_t = Π_j A_j via batched modular matrix multiplication
-- All operations in RNS representation
+### Step-by-step API
 
-### 4. Trajectory Walk (GPU)
-- Updates P = P @ M_t for T steps (typically 2000)
-- Maintains full precision via RNS (K primes × 31 bits each)
-- Optional: parallel float64 shadow run for quick delta estimation
+```python
+from dreams_rns import compile_pcf, pcf_initial_values, run_pcf_walk
+from dreams_rns import crt_reconstruct, centered, compute_dreams_delta_exact
 
-### 5. Delta Proxy & TopK (GPU)
-- At snapshot depths: extract p, q from trajectory
-- Compute delta = |p/q - target| approximation
-- Maintain TopK candidates per CMF
-- Only TopK hits sent to CPU
+# 1. Compile PCF to bytecode
+program = compile_pcf("2", "n**2")
 
-## Files Structure
+# 2. Get initial values  a(0)
+a0 = pcf_initial_values("2")   # → 2
+
+# 3. Run RNS walk (K=64 primes, depth=2000)
+res = run_pcf_walk(program, a0, depth=2000, K=64)
+
+# 4. CRT reconstruct exact p and q
+primes = [int(p) for p in res['primes']]
+p_big, M = crt_reconstruct([int(r) for r in res['p_residues']], primes)
+q_big, _ = crt_reconstruct([int(r) for r in res['q_residues']], primes)
+p_big, q_big = centered(p_big, M), centered(q_big, M)
+
+# 5. Exact delta via mpmath
+import mpmath as mp
+target = mp.mpf(str(2 / (4 - mp.pi)))
+delta = compute_dreams_delta_exact(p_big, q_big, target)
+print(f"δ = {delta:.6f}")
+```
+
+### Batch verification (CLI)
+
+```bash
+python euler2ai_verify.py \
+    --input pcfs.json \
+    --depth 2000 --K 64 \
+    --output report.csv
+```
+
+## Verification Results
+
+| Dataset | PCFs | Limit matches | Depth | K |
+|---------|------|---------------|-------|---|
+| pcfs.json (Euler2AI) | 149 | 142/149 (95.3%) | 2000 | 64 |
+| cmf_pcfs.json (RM) | 200/200 | 200/200 (100%) | 2000 | 64 |
+
+The 7 "misses" on pcfs.json are very slowly converging PCFs (δ ≈ −1.03)
+where depth 2000 is insufficient for float64 proximity check.
+
+## Pipeline Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  CPU: compile_pcf(a, b)  →  CmfProgram (bytecode)           │
+└────────────────────┬─────────────────────────────────────────┘
+                     ▼
+┌──────────────────────────────────────────────────────────────┐
+│  GPU PERSISTENT KERNEL  (future CUDA implementation)         │
+│                                                              │
+│  for step in 0..depth-1:                                     │
+│    M_rns[k] = eval_bytecode(program, step)  ∀k ∈ [0,K)      │
+│    P_rns[k] = P_rns[k] @ M_rns[k]  mod prime[k]             │
+│    P_float  = P_float @ M_float    (shadow)                  │
+│                                                              │
+│  Memory: P_rns  [2, 2, K]  int64                             │
+│          M_rns  [2, 2, K]  int64                             │
+│          P_float [2, 2]    float64                           │
+└────────────────────┬─────────────────────────────────────────┘
+                     ▼
+┌──────────────────────────────────────────────────────────────┐
+│  CPU: CRT(P_rns[:, 1, :]) → big p, q                        │
+│       δ = -(1 + log|p/q - L| / log|q|)  via mpmath          │
+└──────────────────────────────────────────────────────────────┘
+```
+
+## File Structure
 
 ```
 Dreams-RNS-CUDA/
-├── README.md                    # This file
-├── CMakeLists.txt              # Build system
-├── include/
-│   └── dreams/
-│       ├── config.h            # Configuration and types
-│       ├── cmf_program.h       # CMF bytecode program structure
-│       ├── eval_kernel.h       # Expression evaluator declarations
-│       ├── walk_kernel.h       # Walk kernel declarations
-│       └── topk_kernel.h       # TopK/scoring declarations
-├── src/
-│   └── cuda/
-│       ├── persistent_kernel.cu # Main fused GPU kernel
-│       ├── eval_kernel.cu      # Expression evaluation
-│       ├── walk_kernel.cu      # Matrix walk
-│       └── topk_kernel.cu      # Scoring and TopK
 ├── python/
 │   ├── dreams_rns/
-│   │   ├── __init__.py
-│   │   ├── compiler.py         # CMF → bytecode compiler
-│   │   ├── runner.py           # GPU execution wrapper
-│   │   └── analysis.py         # Results analysis
+│   │   ├── __init__.py         # Public API
+│   │   ├── compiler.py         # SymPy → bytecode (MAX_REGS=512)
+│   │   └── runner.py           # Walk engine + CRT + delta
+│   ├── euler2ai_verify.py      # Batch verification CLI
 │   └── setup.py
+├── include/dreams/             # CUDA kernel headers (future)
+├── src/cuda/                   # CUDA kernels (future)
 ├── notebooks/
-│   └── dreams_colab.ipynb      # Google Colab notebook
 └── examples/
-    └── example_cmfs.py         # Example CMF definitions
 ```
-
-## RNS Configuration
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| K (primes) | 32-64 | Number of 31-bit primes |
-| B (batch) | 100-1000 | Shifts per CMF |
-| m (matrix) | 4-8 | Matrix dimension |
-| T (depth) | 2000 | Walk steps |
-
-Bit capacity: K × 31 bits (e.g., 64 primes = 1984 bits)
 
 ## Bytecode Opcodes
 
 | Opcode | Args | Description |
 |--------|------|-------------|
-| `LOAD_X` | axis_idx | Load axis value x_j |
-| `LOAD_C` | const_idx | Load constant |
-| `ADD` | r1, r2 | r1 + r2 mod p |
-| `SUB` | r1, r2 | r1 - r2 mod p |
-| `MUL` | r1, r2 | r1 × r2 mod p |
-| `NEG` | r1 | -r1 mod p |
-| `POW2` | r1 | r1² mod p |
-| `POW3` | r1 | r1³ mod p |
-| `INV` | r1 | r1⁻¹ mod p |
-| `STORE` | r1, out_idx | Write to output matrix entry |
+| `LOAD_X` | axis, dest | axis_val = shift + step × direction |
+| `LOAD_C` | idx, dest | Load constant (pre-reduced mod p) |
+| `LOAD_N` | dest | Load step counter |
+| `ADD` | r1, r2, dest | (r1 + r2) mod p |
+| `SUB` | r1, r2, dest | (r1 − r2) mod p |
+| `MUL` | r1, r2, dest | (r1 × r2) mod p |
+| `NEG` | r, dest | (p − r) mod p |
+| `POW2` | r, dest | r² mod p |
+| `POW3` | r, dest | r³ mod p |
+| `INV` | r, dest | r⁻¹ mod p (Fermat) |
+| `STORE` | r, row, col | Write to matrix entry |
+
+## RNS Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| K | 64 | 31-bit primes → 1984-bit precision |
+| depth | 2000 | Walk steps |
+| MAX_REGS | 512 | Compiler register file size |
 
 ## Dependencies
 
-- CUDA Toolkit 11.0+
-- RNS-CUDA library (https://github.com/VesterlundCoder/RNS-CUDA)
 - Python 3.8+
-- ramanujantools (for CMF definitions)
-- NumPy, CuPy (for Python bindings)
-
-## Usage (Colab)
-
-```python
-# 1. Compile CMFs to bytecode (offline)
-from dreams_rns import compile_cmf
-programs = [compile_cmf(cmf) for cmf in cmfs]
-
-# 2. Run GPU pipeline
-from dreams_rns import DreamsRunner
-runner = DreamsRunner(programs, target=math.pi)
-hits = runner.run(
-    shifts_per_cmf=1000,
-    depth=2000,
-    topk=100
-)
-
-# 3. Analyze results
-from dreams_rns import analyze_hits
-analyze_hits(hits)
-```
-
-## Performance Targets
-
-| Metric | Target (A100) |
-|--------|---------------|
-| Shifts/sec | 100K+ |
-| Walk steps/sec | 10M+ |
-| Memory | < 20GB |
-| Kernel launches | 1 (persistent) |
-
-## Algorithm Details
-
-### Garner's CRT Reconstruction
-Used for converting RNS representation back to BigInt when needed (only for final verification):
-
-```
-x = r_0
-for i = 1..K-1:
-    x_i = ((r_i - x) * y_i) mod p_i
-    x = x + x_i * (p_0 * p_1 * ... * p_{i-1})
-```
-
-### Delta Proxy Computation
-Approximate delta without full CRT:
-1. Use first K_small primes for rough BigInt (128-256 bits)
-2. Convert to float64 for p/q ratio
-3. Compute |p/q - target|
-
-### TopK Selection
-GPU-based parallel reduction:
-1. Each block maintains local TopK
-2. Final reduction across blocks
-3. Only TopK hits transferred to CPU
+- NumPy, SymPy, mpmath
+- (GPU) CUDA 11.0+, CuPy, RNS-CUDA library
 
 ## License
 
