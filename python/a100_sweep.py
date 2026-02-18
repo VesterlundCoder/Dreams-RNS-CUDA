@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dreams_rns import compile_pcf, pcf_initial_values, run_pcf_walk
 from dreams_rns import crt_reconstruct, centered
 from dreams_rns.gpu_walk import gpu_available, run_pcf_walk_batch_gpu
+from dreams_rns.cmf_walk import compile_cmf_spec, run_cmf_walk, shift_to_axis_offsets
 from dreams_rns.constants import (
     load_constants, match_against_constants, compute_delta_against_constant,
 )
@@ -93,6 +94,7 @@ def run_euler2ai_mode(args, constants):
 
     for i, rec in enumerate(records):
         a_str, b_str = rec['a'], rec['b']
+        limit_str = rec.get('limit', None)
         t0 = time.time()
 
         try:
@@ -116,10 +118,25 @@ def run_euler2ai_mode(args, constants):
 
             elapsed = time.time() - t0
 
-            # Match against all constants
-            matches = match_against_constants(est, constants, args.proximity)
+            # 1. Delta against stated limit (each Euler2AI PCF has its own target)
+            delta_stated = float('-inf')
+            limit_float = None
+            if limit_str:
+                import sympy as sp
+                import mpmath as mp
+                mp.mp.dps = args.dps
+                try:
+                    target_expr = sp.sympify(limit_str, locals={
+                        "pi": sp.pi, "E": sp.E, "EulerGamma": sp.EulerGamma})
+                    target_mp = mp.mpf(str(sp.N(target_expr, args.dps)))
+                    limit_float = float(target_mp)
+                    delta_stated = float(compute_delta_against_constant(
+                        p_big, q_big, target_mp, args.dps))
+                except Exception:
+                    pass
 
-            # Compute exact delta for best match
+            # 2. Delta against all 15 bank constants
+            matches = match_against_constants(est, constants, args.proximity)
             best_delta = float('-inf')
             best_const = None
             for c in constants:
@@ -132,7 +149,9 @@ def run_euler2ai_mode(args, constants):
                 'idx': i,
                 'a': a_str,
                 'b': b_str,
-                'limit_stated': rec.get('limit', ''),
+                'limit_stated': limit_str or '',
+                'limit_float': limit_float,
+                'delta_stated': delta_stated,
                 'est_float': est,
                 'best_const': best_const,
                 'best_delta': best_delta,
@@ -142,15 +161,17 @@ def run_euler2ai_mode(args, constants):
             }
             all_results.append(result)
 
-            # Is this a hit?
-            is_hit = best_delta > 0 or len(matches) > 0
+            # Hit if: stated delta > 0, or bank delta > 0, or proximity match
+            is_hit = delta_stated > 0 or best_delta > 0 or len(matches) > 0
             status = "HIT" if is_hit else "---"
             if is_hit:
                 hits.append(result)
 
             match_str = ', '.join(m['name'] for m in matches[:3]) if matches else '-'
-            print(f"  [{i+1:>4}/{len(records)}] {status} δ={best_delta:>8.4f} "
-                  f"→{best_const:<12} est={est:.8f} "
+            delta_show = delta_stated if delta_stated > best_delta else best_delta
+            const_show = 'stated' if delta_stated > best_delta else best_const
+            print(f"  [{i+1:>4}/{len(records)}] {status} δ={delta_show:>8.4f} "
+                  f"→{const_show:<12} est={est:.8f} "
                   f"matches=[{match_str}] ({elapsed:.1f}s) a={a_str}")
 
         except Exception as e:
@@ -213,21 +234,14 @@ def compile_cmf_matrix_to_pcf(spec: Dict) -> Optional[tuple]:
     return a_str, b_str
 
 
-def _shifts_to_int_vals(shifts: List[Dict]) -> List[int]:
-    """Convert rational shift dicts to integer shift_vals for the PCF walker."""
-    vals = []
-    for s in shifts:
-        nums = s.get('nums', [0])
-        vals.append(max(1, 1 + nums[0]))  # ensure positive starting n
-    return vals
-
-
 def run_cmf_sweep_mode(args, constants):
-    """Run CMF sweep: all specs × all shifts, using batched GPU walker.
+    """Run CMF sweep: all specs × trajectories × shifts.
 
-    On GPU (cupy + CUDA): batches all shifts per CMF through the GPU
-    simultaneously, giving ~100-500× speedup over sequential CPU walks.
-    Falls back to CPU numpy if no GPU available.
+    Uses the full r×r companion matrix walk with per-axis variables.
+    Each (CMF, trajectory) pair is compiled once, then walked with each shift.
+
+    For 3F2 (rank=4, dim=5): 1000 CMFs × 8161 traj × 512 shifts = 4.18B walks
+    For a quick first pass: use --max-traj to limit trajectories.
     """
     specs = load_cmf_specs(args.input)
     if args.max_tasks > 0:
@@ -235,23 +249,21 @@ def run_cmf_sweep_mode(args, constants):
 
     trajs = load_trajectories(args.traj)
     shifts = load_shifts(args.shifts)
-    shift_int_vals = _shifts_to_int_vals(shifts)
+
+    max_traj = getattr(args, 'max_traj', 0)
+    if max_traj > 0:
+        trajs = trajs[:max_traj]
 
     n_cmfs = len(specs)
     n_traj = len(trajs)
     n_shifts = len(shifts)
-    total_runs = n_cmfs * n_shifts  # per-shift walks (traj folded into shift for 2×2)
-
-    use_gpu = gpu_available()
-    backend = "GPU (cupy/CUDA)" if use_gpu else "CPU (numpy)"
-    batch_sz = args.batch_size
+    total_walks = n_cmfs * n_traj * n_shifts
 
     print(f"CMF Sweep Configuration:")
-    print(f"  Backend:       {backend}")
     print(f"  CMFs:          {n_cmfs}")
+    print(f"  Trajectories:  {n_traj}")
     print(f"  Shifts:        {n_shifts}")
-    print(f"  Batch size:    {batch_sz}")
-    print(f"  Total walks:   {total_runs:,}")
+    print(f"  Total walks:   {total_walks:,}")
     print(f"  Constants:     {len(constants)}")
     print(f"  Depth={args.depth}, K={args.K}")
     print(f"  Proximity:     {args.proximity}")
@@ -266,108 +278,99 @@ def run_cmf_sweep_mode(args, constants):
         name = spec.get('name', f'CMF_{ci}')
         rank = spec.get('rank', 2)
         spec_hash = spec.get('spec_hash', '')
-
-        # Compile CMF to PCF form
-        try:
-            ab = compile_cmf_matrix_to_pcf(spec)
-            if ab is None:
-                print(f"  [{ci+1}/{n_cmfs}] SKIP compile: {name}")
-                continue
-            a_str, b_str = ab
-
-            program = compile_pcf(a_str, b_str)
-            if program is None:
-                print(f"  [{ci+1}/{n_cmfs}] SKIP compile: {name}")
-                continue
-            a0 = pcf_initial_values(a_str)
-        except Exception as e:
-            print(f"  [{ci+1}/{n_cmfs}] COMPILE ERROR: {name} — {e}")
-            continue
-
+        dim = spec.get('dim', spec['p'] + spec['q'])
         cmf_hits = 0
         t_cmf = time.time()
 
-        # Batched walk: run ALL shifts for this CMF in one GPU call
-        try:
-            batch_results = run_pcf_walk_batch_gpu(
-                program, a0, args.depth, args.K,
-                shift_vals=shift_int_vals,
-                batch_size=batch_sz,
-            )
-        except Exception as e:
-            print(f"  [{ci+1}/{n_cmfs}] WALK ERROR: {name} — {e}")
-            run_count += n_shifts
-            continue
-
-        # Process each result: CRT + constant matching
-        for si, res in enumerate(batch_results):
-            run_count += 1
+        for ti, traj in enumerate(trajs):
+            # Compile once per (CMF, trajectory) pair
             try:
-                primes = [int(p) for p in res['primes']]
-                p_big, Mp = crt_reconstruct(
-                    [int(r) for r in res['p_residues']], primes)
-                q_big, _ = crt_reconstruct(
-                    [int(r) for r in res['q_residues']], primes)
-                p_big = centered(p_big, Mp)
-                q_big = centered(q_big, Mp)
+                program = compile_cmf_spec(spec, trajectory=list(traj))
+                if program is None:
+                    run_count += n_shifts
+                    continue
+            except Exception as e:
+                run_count += n_shifts
+                continue
 
-                est = (res['p_float'] / res['q_float']
-                       if abs(res['q_float']) > 1e-300 else float('nan'))
+            # Walk with each shift
+            for si, shift in enumerate(shifts):
+                run_count += 1
+                try:
+                    shift_offsets = shift_to_axis_offsets(shift, spec['p'])
+                    # Pad/truncate to dim if needed
+                    while len(shift_offsets) < dim:
+                        shift_offsets.append(1)
+                    shift_offsets = shift_offsets[:dim]
 
-                # Quick proximity check (cheap, float-only)
-                proximity_matches = match_against_constants(
-                    est, constants, args.proximity)
+                    res = run_cmf_walk(program, args.depth, args.K, shift_offsets)
 
-                # Exact delta only for proximity matches or a quick float check
-                best_delta = float('-inf')
-                best_const = None
+                    primes = [int(p) for p in res['primes']]
+                    p_big, Mp = crt_reconstruct(
+                        [int(r) for r in res['p_residues']], primes)
+                    q_big, _ = crt_reconstruct(
+                        [int(r) for r in res['q_residues']], primes)
+                    p_big = centered(p_big, Mp)
+                    q_big = centered(q_big, Mp)
 
-                # If there's a proximity match, compute exact delta for those
-                if proximity_matches:
-                    for m in proximity_matches:
-                        c = next(c for c in constants if c['name'] == m['name'])
-                        delta = compute_delta_against_constant(
-                            p_big, q_big, c['value'], args.dps)
-                        if delta > best_delta:
-                            best_delta = delta
-                            best_const = c['name']
-                else:
-                    # No proximity match — compute float-approx delta for all
-                    # (much cheaper than exact mpmath for every constant)
-                    for c in constants:
-                        if abs(est - c['value_float']) < 1.0:  # rough filter
+                    est = (res['p_float'] / res['q_float']
+                           if abs(res['q_float']) > 1e-300 else float('nan'))
+
+                    if not math.isfinite(est):
+                        continue
+
+                    # Quick proximity check (cheap, float-only)
+                    proximity_matches = match_against_constants(
+                        est, constants, args.proximity)
+
+                    # Exact delta for proximity matches or nearby constants
+                    best_delta = float('-inf')
+                    best_const = None
+
+                    if proximity_matches:
+                        for m in proximity_matches:
+                            c = next(c for c in constants if c['name'] == m['name'])
                             delta = compute_delta_against_constant(
                                 p_big, q_big, c['value'], args.dps)
                             if delta > best_delta:
                                 best_delta = delta
                                 best_const = c['name']
+                    else:
+                        for c in constants:
+                            if abs(est - c['value_float']) < 1.0:
+                                delta = compute_delta_against_constant(
+                                    p_big, q_big, c['value'], args.dps)
+                                if delta > best_delta:
+                                    best_delta = delta
+                                    best_const = c['name']
 
-                is_hit = best_delta > 0 or len(proximity_matches) > 0
-                if is_hit:
-                    result = {
-                        'cmf_name': name,
-                        'spec_hash': spec_hash,
-                        'rank': rank,
-                        'a': a_str,
-                        'b': b_str,
-                        'shift_idx': si,
-                        'shift_val': res.get('shift_val', shift_int_vals[si]),
-                        'est_float': est,
-                        'best_const': best_const,
-                        'best_delta': best_delta,
-                        'p_bits': Mp.bit_length(),
-                        'proximity_matches': [m['name'] for m in proximity_matches],
-                        'delta_positive': best_delta > 0,
-                    }
-                    hits.append(result)
-                    cmf_hits += 1
-                    hit_count += 1
+                    is_hit = best_delta > 0 or len(proximity_matches) > 0
+                    if is_hit:
+                        result = {
+                            'cmf_name': name,
+                            'spec_hash': spec_hash,
+                            'rank': rank,
+                            'traj_idx': ti,
+                            'traj': list(traj),
+                            'shift_idx': si,
+                            'shift_offsets': shift_offsets,
+                            'est_float': est,
+                            'best_const': best_const,
+                            'best_delta': best_delta,
+                            'p_bits': Mp.bit_length(),
+                            'proximity_matches': [m['name'] for m in proximity_matches],
+                            'delta_positive': best_delta > 0,
+                        }
+                        hits.append(result)
+                        cmf_hits += 1
+                        hit_count += 1
 
-            except Exception:
-                continue
+                except Exception:
+                    continue
 
         elapsed_cmf = time.time() - t_cmf
-        rate = n_shifts / elapsed_cmf if elapsed_cmf > 0 else 0
+        walks_this_cmf = n_traj * n_shifts
+        rate = walks_this_cmf / elapsed_cmf if elapsed_cmf > 0 else 0
         print(f"  [{ci+1:>4}/{n_cmfs}] {name:<40} "
               f"hits={cmf_hits:>4} "
               f"({elapsed_cmf:.1f}s, {rate:.0f} walks/s)")
@@ -440,6 +443,8 @@ def main():
                         help="Proximity threshold for constant matching")
     parser.add_argument("--max-tasks", type=int, default=0,
                         help="Max CMFs/PCFs to process (0=all)")
+    parser.add_argument("--max-traj", type=int, default=0,
+                        help="Max trajectories per CMF (0=all, CMF mode only)")
     parser.add_argument("--batch-size", type=int, default=256,
                         help="GPU batch size (walks per GPU kernel)")
     parser.add_argument("--output", type=str, default="results/",

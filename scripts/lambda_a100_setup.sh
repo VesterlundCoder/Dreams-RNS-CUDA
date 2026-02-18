@@ -56,9 +56,10 @@ python3 a100_sweep.py \
     --proximity 1e-3 \
     --output "${RESULTS}/euler2ai/"
 
-# ── 5. 3F2 CMF sweep (1000 CMFs × 512 shifts) ──────────────────────
+# ── 5. 3F2 CMF sweep: first pass (10 traj × 512 shifts × 1000 CMFs) ─
 echo ""
-echo "=== 3F2 CMF sweep: 1000 CMFs × 512 shifts × 15 constants ==="
+echo "=== 3F2 CMF sweep (first pass): 1000 CMFs × 10 traj × 512 shifts ==="
+echo "    Full r×r walk with per-axis trajectories + shifts"
 echo "    (depth=2000, K=32, proximity=1e-3)"
 python3 a100_sweep.py \
     --mode cmf \
@@ -67,7 +68,19 @@ python3 a100_sweep.py \
     --shifts "${SWEEPDIR}/shifts/dim5_shifts.json" \
     --depth 2000 --K 32 \
     --proximity 1e-3 \
-    --output "${RESULTS}/3F2_part00/"
+    --max-traj 10 \
+    --output "${RESULTS}/3F2_first_pass/"
+
+# ── 6. Full 3F2 sweep (all 8161 traj — run manually if first pass looks good)
+# Uncomment to run the full sweep (estimated ~24-48h on CPU, faster on GPU):
+# python3 a100_sweep.py \
+#     --mode cmf \
+#     --input "${SWEEPDIR}/3F2/3F2_part00.jsonl" \
+#     --traj "${SWEEPDIR}/trajectories/dim5_trajectories.json" \
+#     --shifts "${SWEEPDIR}/shifts/dim5_shifts.json" \
+#     --depth 2000 --K 32 \
+#     --proximity 1e-3 \
+#     --output "${RESULTS}/3F2_full/"
 
 # ── 6. Summary ──────────────────────────────────────────────────────
 echo ""
