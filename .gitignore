@@ -30,10 +30,10 @@ Thumbs.db
 .ipynb_checkpoints/
 *.ipynb_checkpoints
 
-# Results
-*.json
+# Results / generated data
 *.csv
-!examples/*.json
+sweep_data/
+results/
 
 # Logs
 *.log

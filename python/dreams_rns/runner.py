@@ -335,7 +335,7 @@ def _matmul_2x2_mod(A: np.ndarray, B: np.ndarray, pp: np.ndarray) -> np.ndarray:
 
 # ── Main walk function ──────────────────────────────────────────────────
 
-def run_pcf_walk(program: CmfProgram, a0: int, depth: int, K: int = 64,
+def run_pcf_walk(program: CmfProgram, a0: int, depth: int, K: int = 32,
                  shift_val: int = 1):
     """Run the RNS walk for a PCF and return raw results.
 
@@ -414,7 +414,7 @@ def run_pcf_walk(program: CmfProgram, a0: int, depth: int, K: int = 64,
 
 
 def verify_pcf(a_str: str, b_str: str, limit_str: str,
-               depth: int = 2000, K: int = 64, dps: int = 200):
+               depth: int = 2000, K: int = 32, dps: int = 200):
     """End-to-end PCF verification: compile → walk → CRT → delta.
 
     Args:

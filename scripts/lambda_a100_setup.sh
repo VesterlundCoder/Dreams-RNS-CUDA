@@ -1,21 +1,28 @@
 #!/bin/bash
-# Lambda Labs A100 setup for Dreams-RNS-CUDA verification
-# Usage: scp this script + data to the instance, then run it
+# Lambda Labs A100 setup for Dreams-RNS-CUDA full sweep
 #
-#   scp -i euler2ai.pem lambda_a100_setup.sh pcfs.json cmf_pcfs.json ubuntu@<IP>:~/
-#   ssh -i euler2ai.pem ubuntu@<IP> 'bash lambda_a100_setup.sh'
+# Runs:
+#   1. Euler2AI Pi PCFs (149 PCFs against 15 constants)
+#   2. 3F2 CMF sweep (1000 CMFs × 512 shifts, multi-constant matching)
+#
+# Upload:
+#   scp -i key.pem scripts/lambda_a100_setup.sh pcfs.json ubuntu@<IP>:~/
+#   ssh -i key.pem ubuntu@<IP> 'bash lambda_a100_setup.sh'
+#
+# Results saved where: limit within 1e-3 of a constant OR delta > 0
 
 set -euo pipefail
-echo "=== Dreams-RNS-CUDA A100 Setup ==="
+echo "============================================================"
+echo "  Dreams-RNS-CUDA A100 Sweep"
+echo "  K=32 (992-bit), depth=2000, 15 mathematical constants"
+echo "============================================================"
 
-# 1. System packages
+# ── 1. Dependencies ──────────────────────────────────────────────────
 sudo apt-get update -qq
 sudo apt-get install -y -qq python3-pip git
+pip3 install --quiet numpy sympy mpmath scipy
 
-# 2. Python dependencies
-pip3 install --quiet numpy sympy mpmath tqdm
-
-# 3. Clone the repo
+# ── 2. Clone / update repo ──────────────────────────────────────────
 cd ~
 if [ -d "Dreams-RNS-CUDA" ]; then
     cd Dreams-RNS-CUDA && git pull origin main && cd ~
@@ -23,33 +30,64 @@ else
     git clone https://github.com/VesterlundCoder/Dreams-RNS-CUDA.git
 fi
 
-# 4. Quick smoke test (5 PCFs, low depth)
+PYDIR=~/Dreams-RNS-CUDA/python
+SWEEPDIR=~/Dreams-RNS-CUDA/sweep_data
+RESULTS=~/results
+mkdir -p "${RESULTS}"
+
+# ── 3. Smoke test (5 PCFs, shallow) ─────────────────────────────────
 echo ""
 echo "=== Smoke test (5 PCFs, depth=500, K=16) ==="
-cd ~/Dreams-RNS-CUDA/python
-python3 euler2ai_verify.py \
+cd "${PYDIR}"
+python3 a100_sweep.py \
+    --mode euler2ai \
     --input ~/pcfs.json \
     --depth 500 --K 16 --max-tasks 5 \
-    --output ~/smoke_report.csv
+    --output "${RESULTS}/smoke/"
 
-# 5. Full pcfs.json run
+# ── 4. Euler2AI Pi PCFs (full, 149 PCFs) ────────────────────────────
 echo ""
-echo "=== Full pcfs.json (149 PCFs, depth=2000, K=32) ==="
-python3 euler2ai_verify.py \
+echo "=== Euler2AI: 149 PCFs × 15 constants (depth=2000, K=32) ==="
+python3 a100_sweep.py \
+    --mode euler2ai \
     --input ~/pcfs.json \
-    --depth 2000 --K 32 --max-tasks 0 \
-    --output ~/pcfs_report.csv
+    --depth 2000 --K 32 \
+    --proximity 1e-3 \
+    --output "${RESULTS}/euler2ai/"
 
-# 6. Full cmf_pcfs.json run (if file exists)
-if [ -f ~/cmf_pcfs.json ]; then
-    echo ""
-    echo "=== Full cmf_pcfs.json (1693 PCFs, depth=2000, K=32) ==="
-    python3 euler2ai_verify.py \
-        --input ~/cmf_pcfs.json \
-        --depth 2000 --K 32 --max-tasks 0 \
-        --output ~/cmf_pcfs_report.csv
-fi
-
+# ── 5. 3F2 CMF sweep (1000 CMFs × 512 shifts) ──────────────────────
 echo ""
-echo "=== Done! Reports in ~/  ==="
-ls -la ~/*report*.csv
+echo "=== 3F2 CMF sweep: 1000 CMFs × 512 shifts × 15 constants ==="
+echo "    (depth=2000, K=32, proximity=1e-3)"
+python3 a100_sweep.py \
+    --mode cmf \
+    --input "${SWEEPDIR}/3F2/3F2_part00.jsonl" \
+    --traj "${SWEEPDIR}/trajectories/dim5_trajectories.json" \
+    --shifts "${SWEEPDIR}/shifts/dim5_shifts.json" \
+    --depth 2000 --K 32 \
+    --proximity 1e-3 \
+    --output "${RESULTS}/3F2_part00/"
+
+# ── 6. Summary ──────────────────────────────────────────────────────
+echo ""
+echo "============================================================"
+echo "  DONE — Results in ${RESULTS}/"
+echo "============================================================"
+echo ""
+echo "Euler2AI hits:"
+if [ -f "${RESULTS}/euler2ai/euler2ai_hits.csv" ]; then
+    wc -l "${RESULTS}/euler2ai/euler2ai_hits.csv"
+    head -5 "${RESULTS}/euler2ai/euler2ai_hits.csv"
+else
+    echo "  (no hits)"
+fi
+echo ""
+echo "3F2 CMF hits:"
+if [ -f "${RESULTS}/3F2_part00/cmf_hits.csv" ]; then
+    wc -l "${RESULTS}/3F2_part00/cmf_hits.csv"
+    head -5 "${RESULTS}/3F2_part00/cmf_hits.csv"
+else
+    echo "  (no hits)"
+fi
+echo ""
+find "${RESULTS}" -name "*.jsonl" -o -name "*.csv" | sort

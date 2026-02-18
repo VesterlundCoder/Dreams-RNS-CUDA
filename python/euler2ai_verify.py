@@ -6,8 +6,8 @@ Loads PCFs from pcfs.json or cmf_pcfs.json (JSONL), runs the correct
 companion-matrix walk, and verifies against stated limits.
 
 Usage:
-    python euler2ai_verify.py --input pcfs.json --depth 2000 --K 64 --max-tasks 20
-    python euler2ai_verify.py --input cmf_pcfs.json --depth 2000 --K 64 --max-tasks 50
+    python euler2ai_verify.py --input pcfs.json --depth 2000 --K 32 --max-tasks 20
+    python euler2ai_verify.py --input cmf_pcfs.json --depth 2000 --K 32 --max-tasks 50
 """
 import argparse
 import json
@@ -64,7 +64,7 @@ def main():
     parser.add_argument("--input", type=str, required=True,
                         help="Path to pcfs.json or cmf_pcfs.json")
     parser.add_argument("--depth", type=int, default=2000)
-    parser.add_argument("--K", type=int, default=64)
+    parser.add_argument("--K", type=int, default=32)
     parser.add_argument("--max-tasks", type=int, default=0,
                         help="0 = all")
     parser.add_argument("--output", type=str, default="verify_report.csv")
