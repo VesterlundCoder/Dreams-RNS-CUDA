@@ -38,11 +38,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dreams_rns import compile_pcf, pcf_initial_values, run_pcf_walk
 from dreams_rns import crt_reconstruct, centered
-from dreams_rns.gpu_walk import gpu_available, run_pcf_walk_batch_gpu, run_cmf_walk_batch_gpu
-from dreams_rns.cmf_walk import compile_cmf_spec, run_cmf_walk, shift_to_axis_offsets
 from dreams_rns.constants import (
     load_constants, match_against_constants, compute_delta_against_constant,
 )
+
+# Lazy GPU imports — only loaded when CMF mode actually runs
+def _lazy_gpu_imports():
+    from dreams_rns.gpu_walk import gpu_available, run_pcf_walk_batch_gpu, run_cmf_walk_batch_gpu
+    return gpu_available, run_pcf_walk_batch_gpu, run_cmf_walk_batch_gpu
+
+def _lazy_cmf_imports():
+    from dreams_rns.cmf_walk import compile_cmf_spec, run_cmf_walk, shift_to_axis_offsets
+    return compile_cmf_spec, run_cmf_walk, shift_to_axis_offsets
 
 
 # ── Euler2AI mode ────────────────────────────────────────────────────────
@@ -293,6 +300,10 @@ def run_cmf_sweep_mode(args, constants):
     For 3F2 (rank=4, dim=5): 1000 CMFs × 8161 traj × 512 shifts = 4.18B walks
     For a quick first pass: use --max-traj to limit trajectories.
     """
+    # Lazy imports — only loaded when CMF mode is actually used
+    gpu_available, _, run_cmf_walk_batch_gpu = _lazy_gpu_imports()
+    compile_cmf_spec, run_cmf_walk, shift_to_axis_offsets = _lazy_cmf_imports()
+
     specs = load_cmf_specs(args.input)
     if args.max_tasks > 0:
         specs = specs[:args.max_tasks]
