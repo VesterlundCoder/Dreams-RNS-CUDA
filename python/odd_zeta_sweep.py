@@ -121,85 +121,112 @@ def compute_initial_state(n: int):
     return v
 
 
-def run_odd_zeta_walk(program, depth: int, K: int, shift: int, n: int):
-    """State-vector walk for odd-zeta CMF: v(k+1) = M(k) · v(k).
+def parse_sympy_matrix(spec: Dict):
+    """Parse a spec's matrix dict into a sympy Matrix."""
+    rank = spec['rank']
+    k = sp.Symbol('k')
+    M = sp.zeros(rank, rank)
+    for key, expr_str in spec['matrix'].items():
+        r, c = key.split(',')
+        M[int(r), int(c)] = sp.sympify(expr_str)
+    return M
 
-    This is LEFT multiplication (SageMath convention), not the standard
-    PCF right-multiplication P = M(1)·M(2)·...·M(N).
 
-    Args:
-        program: compiled CmfProgram
-        depth: walk depth
-        K: number of RNS primes
-        shift: starting value of k (usually 1)
-        n: the n in ζ(2n+1) (for initial state)
+def _lcm(a, b):
+    """Least common multiple of two positive integers."""
+    from math import gcd
+    return a * b // gcd(a, b)
+
+
+def run_odd_zeta_walk(sympy_matrix, depth: int, K: int, shift: int, n: int):
+    """Denominator-cleared integer walk for odd-zeta CMF.
+
+    At each step k:
+      1. Evaluate M(k) as exact sympy Rationals
+      2. Find common denominator D(k) = lcm of all entry denominators
+      3. Scale M_int(k) = D(k) * M(k)  →  all-integer matrix
+      4. u = M_int(k) · u  mod each prime  (RNS integer arithmetic)
+      5. Float shadow: v = M_float(k) · v
+
+    Since v[const_idx] = 1 in the original walk, u[const_idx] accumulates
+    the product D_init * D(1) * D(2) * ... * D(N) = total denominator.
+    CRT gives exact integers: p = u[acc], q = u[const].
+    δ = -(1 + log|p/q - L| / log|q|)  — proper Dreams delta.
 
     Returns:
-        dict with acc_residues, const_residues, acc_float, log_scale, primes
+        dict with p_residues, q_residues, p_float, q_float, log_scale, primes
     """
-    from dreams_rns.cmf_walk import (
-        _eval_bytecode_allprimes_multiaxis,
-        _eval_bytecode_float_multiaxis,
-        _precompute_const_residues,
-    )
-
-    r = program.m
+    k_sym = sp.Symbol('k')
+    r = sympy_matrix.rows
     pp = generate_rns_primes(K).astype(np.int64)
-    const_table = _precompute_const_residues(program, pp)
 
-    # Initial state as rationals → convert to RNS residues
+    # Initial state as exact rationals
     v0_frac = compute_initial_state(n)
 
-    # RNS state vector: v_rns[i, k] = v[i] mod prime_k
-    v_rns = np.zeros((r, K), dtype=np.int64)
-    for i in range(r):
-        num = v0_frac[i].numerator
-        den = v0_frac[i].denominator
-        for ki in range(K):
-            p = int(pp[ki])
-            num_mod = num % p
-            den_mod = den % p
-            den_inv = pow(den_mod, p - 2, p) if den_mod != 0 else 0
-            v_rns[i, ki] = (num_mod * den_inv) % p
+    # Common denominator of initial state
+    D_init = 1
+    for f in v0_frac:
+        if f.denominator != 0:
+            D_init = _lcm(D_init, f.denominator)
 
-    # Float state vector
+    # u(0) = D_init * v(0), all integers
+    u0 = [int(D_init * f) for f in v0_frac]
+
+    # RNS state: u_rns[i, ki] = u[i] mod prime[ki]
+    u_rns = np.zeros((r, K), dtype=np.int64)
+    for i in range(r):
+        for ki in range(K):
+            u_rns[i, ki] = u0[i] % int(pp[ki])
+
+    # Float shadow (original scale, not denominator-cleared)
     v_f = np.array([float(f) for f in v0_frac], dtype=np.float64)
     log_scale = 0.0
 
-    shift_vals = [shift]
-
-    # Track denominator growth analytically
-    # For HPHP08 CMF at axis value v = shift + step:
-    #   Key denominators: 2*(2v+1), v², (v+1)^(2n+1)
-    log_denom = 0.0
-
     for step in range(depth):
-        v_val = shift + step  # axis value at this step
+        k_val = shift + step
 
-        # Estimate denominator contribution from M(step)
-        # rk = -(v+1)/(2*(2v+1)) → denom factor: 2*(2v+1)
-        # rk/v² → extra factor: v²
-        # accumulator: (1/2)/(v+1)³ and 1/(v+1)^(2t) → factor: 2*(v+1)^(2n+1)
-        if v_val > 0:
-            log_denom += math.log(2*(2*v_val+1))
-            log_denom += 2*math.log(max(v_val, 1))
-            log_denom += (2*n+1) * math.log(v_val + 1)
-            log_denom += math.log(2)
+        # Evaluate M(k_val) as exact sympy Rationals
+        M_rat = sympy_matrix.subs(k_sym, k_val)
 
-        # Evaluate M(step) for all primes and float
-        M_rns = _eval_bytecode_allprimes_multiaxis(
-            program, step, shift_vals, pp, const_table)  # (r, r, K)
-        M_f = _eval_bytecode_float_multiaxis(program, step, shift_vals)  # (r, r)
-
-        # v = M · v (LEFT multiply, state vector)
-        new_v_rns = np.zeros_like(v_rns)
+        # Find common denominator of all non-zero entries
+        D_k = 1
         for i in range(r):
             for j in range(r):
-                new_v_rns[i] = (new_v_rns[i] + M_rns[i, j] * v_rns[j]) % pp
-        v_rns = new_v_rns
+                entry = M_rat[i, j]
+                if entry != 0:
+                    rat = sp.Rational(entry)
+                    D_k = _lcm(D_k, abs(int(rat.q)))
 
-        new_v_f = M_f @ v_f
-        v_f = new_v_f
+        # Compute integer matrix entries and convert to RNS
+        # M_int[i,j] = D_k * M_rat[i,j] = num * (D_k / den)
+        M_rns = np.zeros((r, r, K), dtype=np.int64)
+        M_float = np.zeros((r, r), dtype=np.float64)
+        for i in range(r):
+            for j in range(r):
+                entry = M_rat[i, j]
+                if entry != 0:
+                    rat = sp.Rational(entry)
+                    num_ij = int(rat.p)
+                    den_ij = abs(int(rat.q))
+                    scale_ij = D_k // den_ij  # always exact integer
+                    int_val = num_ij * scale_ij
+                    M_float[i, j] = float(rat)
+                    # Convert to RNS residues
+                    for ki in range(K):
+                        p = int(pp[ki])
+                        M_rns[i, j, ki] = int_val % p
+
+        # u = M_int · u  mod each prime (integer matrix × integer vector)
+        new_u_rns = np.zeros_like(u_rns)
+        for i in range(r):
+            for j in range(r):
+                # Only multiply if M_int[i,j] != 0
+                if M_float[i, j] != 0.0:
+                    new_u_rns[i] = (new_u_rns[i] + M_rns[i, j] * u_rns[j]) % pp
+        u_rns = new_u_rns
+
+        # Float shadow (original rational values, not scaled)
+        v_f = M_float @ v_f
 
         # Normalize float shadow
         mx = np.max(np.abs(v_f))
@@ -207,17 +234,16 @@ def run_odd_zeta_walk(program, depth: int, K: int, shift: int, n: int):
             v_f /= mx
             log_scale += math.log(mx)
 
-    # Extract accumulator (index n) and constant (index n+1)
+    # Extract: p = u[acc_idx], q = u[const_idx]
     acc_idx = n
     const_idx = n + 1
 
     return {
-        'acc_residues': v_rns[acc_idx],
-        'const_residues': v_rns[const_idx],
-        'acc_float': v_f[acc_idx],
-        'const_float': v_f[const_idx],
+        'p_residues': u_rns[acc_idx],
+        'q_residues': u_rns[const_idx],
+        'p_float': v_f[acc_idx],
+        'q_float': v_f[const_idx],
         'log_scale': log_scale,
-        'log_denom': log_denom,
         'primes': pp,
     }
 
@@ -285,12 +311,12 @@ def main():
         print(f"\n{'─'*80}")
         print(f"[{ci+1}/{len(specs)}] {name}: ζ({zeta_val}), {rank}×{rank} matrix")
 
-        # Compile
+        # Parse sympy matrix (once per CMF)
         t0 = time.time()
         try:
-            program = compile_odd_zeta_cmf(spec)
+            sympy_mat = parse_sympy_matrix(spec)
         except Exception as e:
-            print(f"  COMPILE ERROR: {e}")
+            print(f"  PARSE ERROR: {e}")
             continue
 
         # Auto-K
@@ -300,7 +326,7 @@ def main():
             K_use = estimate_K_for_cmf(rank, args.depth)
         print(f"  K={K_use} ({K_use*31} bits CRT range)")
 
-        compile_time = time.time() - t0
+        parse_time = time.time() - t0
 
         # Walk with each shift
         cmf_results = []
@@ -308,74 +334,95 @@ def main():
 
         for si in range(1, args.shifts + 1):
             try:
-                res = run_odd_zeta_walk(program, args.depth, K_use, shift=si, n=n)
+                res = run_odd_zeta_walk(sympy_mat, args.depth, K_use, shift=si, n=n)
 
-                # CRT reconstruction of accumulator and constant
+                # CRT reconstruction: p = numerator, q = denominator (both exact integers)
                 primes = [int(p) for p in res['primes']]
-                acc_big, Mp = crt_reconstruct(
-                    [int(r) for r in res['acc_residues']], primes)
-                const_big, _ = crt_reconstruct(
-                    [int(r) for r in res['const_residues']], primes)
-                acc_big = centered(acc_big, Mp)
-                const_big = centered(const_big, Mp)
+                p_big, Mp = crt_reconstruct(
+                    [int(r) for r in res['p_residues']], primes)
+                q_big, _ = crt_reconstruct(
+                    [int(r) for r in res['q_residues']], primes)
+                p_big = centered(p_big, Mp)
+                q_big = centered(q_big, Mp)
 
-                # Float estimate: accumulator / constant
-                acc_f = res['acc_float']
-                const_f = res['const_float']
-                est = acc_f / const_f if abs(const_f) > 1e-300 else float('nan')
-                log_scale = res['log_scale']
+                # Float estimate from shadow
+                pf = res['p_float']
+                qf = res['q_float']
+                est_float = pf / qf if abs(qf) > 1e-300 else float('nan')
 
-                if not math.isfinite(est):
+                if not math.isfinite(est_float):
                     continue
 
-                # CRT overflow check
+                # CRT overflow check: exact ratio should match float
                 mp.mp.dps = args.dps
                 crt_ok = True
-                if const_big == 0:
+                if q_big == 0:
                     crt_ok = False
                 else:
                     try:
-                        cr = float(mp.mpf(acc_big) / mp.mpf(const_big))
+                        cr = float(mp.mpf(p_big) / mp.mpf(q_big))
                         if not math.isfinite(cr):
                             crt_ok = False
-                        elif abs(est) > 1e-10:
-                            crt_ok = abs(cr - est) / abs(est) < 0.01
+                        elif abs(est_float) > 1e-10:
+                            crt_ok = abs(cr - est_float) / abs(est_float) < 0.01
                         else:
-                            crt_ok = abs(cr - est) < 0.01
+                            crt_ok = abs(cr - est_float) < 0.01
                     except Exception:
                         crt_ok = False
 
-                # Check all constants using float delta with analytical denominator
+                # Check all constants — exact CRT delta when possible, float fallback
                 best_delta = float('-inf')
                 best_const = None
-                log_denom = res['log_denom']
+                best_digits = 0
 
                 for c in constants:
-                    try:
-                        err = abs(est - c['value_float'])
-                        if err > 0 and log_denom > 0:
-                            delta = -(1.0 + math.log(err) / log_denom)
-                        elif err == 0:
-                            delta = float('inf')
-                        else:
+                    if crt_ok and q_big != 0:
+                        delta = compute_delta_against_constant(
+                            p_big, q_big, c['value'], args.dps)
+                    else:
+                        # Float fallback using log_scale for q estimate
+                        try:
+                            err = abs(est_float - c['value_float'])
+                            log_q = res['log_scale'] + (
+                                math.log(abs(qf)) if abs(qf) > 1e-300 else 0)
+                            if err > 0 and log_q > 0:
+                                delta = -(1.0 + math.log(err) / log_q)
+                            elif err == 0:
+                                delta = float('inf')
+                            else:
+                                delta = float('-inf')
+                        except Exception:
                             delta = float('-inf')
-                    except Exception:
-                        delta = float('-inf')
 
                     if delta > best_delta:
                         best_delta = delta
                         best_const = c['name']
+
+                # Matching digits (float-level)
+                for c in constants:
+                    if c['name'] == best_const:
+                        try:
+                            rel_err = abs(est_float - c['value_float'])
+                            if rel_err > 0:
+                                best_digits = -math.log10(rel_err / max(abs(c['value_float']), 1e-300))
+                            else:
+                                best_digits = 16.0
+                        except Exception:
+                            best_digits = 0
+                        break
 
                 result = {
                     'cmf': name,
                     'zeta_val': zeta_val,
                     'rank': rank,
                     'shift': si,
-                    'est': est,
+                    'est': est_float,
                     'best_const': best_const,
                     'best_delta': best_delta,
-                    'crt_ok': crt_ok,
+                    'match_digits': round(best_digits, 1),
+                    'crt_ok': str(crt_ok),
                     'p_bits': Mp.bit_length(),
+                    'q_bits': q_big.bit_length() if q_big else 0,
                 }
 
                 cmf_results.append(result)
@@ -391,18 +438,19 @@ def main():
 
         elapsed = time.time() - t0
 
-        # Report
+        # Report — use δ > 0 OR matching_digits > 6 as "hit"
         n_positive = sum(1 for r in cmf_results if r['best_delta'] > 0)
+        n_good = sum(1 for r in cmf_results if r['match_digits'] >= 6)
         n_valid = len(cmf_results)
 
         if best_hit:
-            print(f"  {n_valid}/{args.shifts} walks OK, {n_positive} with δ>0")
+            print(f"  {n_valid}/{args.shifts} walks OK, {n_positive} with δ>0, {n_good} with ≥6 digits")
             print(f"  Best: δ={best_hit['best_delta']:.6f} → {best_hit['best_const']} "
-                  f"(shift={best_hit['shift']}, est={best_hit['est']:.10f})")
+                  f"({best_hit['match_digits']} digits, shift={best_hit['shift']}, est={best_hit['est']:.12f})")
         else:
             print(f"  No valid results")
 
-        print(f"  ({elapsed:.1f}s, {n_valid/elapsed:.0f} walks/s)" if elapsed > 0 else "")
+        print(f"  ({elapsed:.1f}s, {n_valid/max(elapsed,0.001):.0f} walks/s)")
 
         # Save per-CMF results
         all_results.extend(cmf_results)
@@ -423,13 +471,16 @@ def main():
             if cmf_res:
                 best = max(cmf_res, key=lambda x: x['best_delta'])
                 n_pos = sum(1 for r in cmf_res if r['best_delta'] > 0)
+                n_good = sum(1 for r in cmf_res if r['match_digits'] >= 6)
                 summary_rows.append({
                     'cmf': name,
                     'zeta': zv,
                     'rank': rk,
                     'n_shifts': len(cmf_res),
                     'n_positive_delta': n_pos,
+                    'n_good_digits': n_good,
                     'best_delta': f"{best['best_delta']:.6f}",
+                    'best_digits': best['match_digits'],
                     'best_const': best['best_const'],
                     'best_shift': best['shift'],
                     'best_est': f"{best['est']:.12f}",
