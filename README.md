@@ -24,11 +24,11 @@ result = verify_pcf(
     b_str="n**2",
     limit_str="2/(4 - pi)",
     depth=2000,
-    K=64,
+    K=32,
 )
 print(f"δ_exact = {result['delta_exact']:.6f}")   # ≈ -1.000291
 print(f"δ_float = {result['delta_float']:.6f}")   # ≈ -0.998855
-print(f"p bits  = {result['p_bits']}")             # 1984
+print(f"p bits  = {result['p_bits']}")             # 992
 ```
 
 ### Step-by-step API
@@ -43,8 +43,8 @@ program = compile_pcf("2", "n**2")
 # 2. Get initial values  a(0)
 a0 = pcf_initial_values("2")   # → 2
 
-# 3. Run RNS walk (K=64 primes, depth=2000)
-res = run_pcf_walk(program, a0, depth=2000, K=64)
+# 3. Run RNS walk (K=32 primes, depth=2000)
+res = run_pcf_walk(program, a0, depth=2000, K=32)
 
 # 4. CRT reconstruct exact p and q
 primes = [int(p) for p in res['primes']]
@@ -64,7 +64,7 @@ print(f"δ = {delta:.6f}")
 ```bash
 python euler2ai_verify.py \
     --input pcfs.json \
-    --depth 2000 --K 64 \
+    --depth 2000 --K 32 \
     --output report.csv
 ```
 
@@ -72,8 +72,8 @@ python euler2ai_verify.py \
 
 | Dataset | PCFs | Limit matches | Depth | K |
 |---------|------|---------------|-------|---|
-| pcfs.json (Euler2AI) | 149 | 142/149 (95.3%) | 2000 | 64 |
-| cmf_pcfs.json (RM) | 200/200 | 200/200 (100%) | 2000 | 64 |
+| pcfs.json (Euler2AI) | 149 | 142/149 (95.3%) | 2000 | 32 |
+| cmf_pcfs.json (RM) | 200/200 | 200/200 (100%) | 2000 | 32 |
 
 The 7 "misses" on pcfs.json are very slowly converging PCFs (δ ≈ −1.03)
 where depth 2000 is insufficient for float64 proximity check.
@@ -141,7 +141,7 @@ Dreams-RNS-CUDA/
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| K | 64 | 31-bit primes → 1984-bit precision |
+| K | 32 | 31-bit primes → 992-bit precision |
 | depth | 2000 | Walk steps |
 | MAX_REGS | 512 | Compiler register file size |
 

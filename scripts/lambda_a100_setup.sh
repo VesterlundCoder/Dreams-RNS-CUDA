@@ -34,19 +34,19 @@ python3 euler2ai_verify.py \
 
 # 5. Full pcfs.json run
 echo ""
-echo "=== Full pcfs.json (149 PCFs, depth=2000, K=64) ==="
+echo "=== Full pcfs.json (149 PCFs, depth=2000, K=32) ==="
 python3 euler2ai_verify.py \
     --input ~/pcfs.json \
-    --depth 2000 --K 64 --max-tasks 0 \
+    --depth 2000 --K 32 --max-tasks 0 \
     --output ~/pcfs_report.csv
 
 # 6. Full cmf_pcfs.json run (if file exists)
 if [ -f ~/cmf_pcfs.json ]; then
     echo ""
-    echo "=== Full cmf_pcfs.json (1693 PCFs, depth=2000, K=64) ==="
+    echo "=== Full cmf_pcfs.json (1693 PCFs, depth=2000, K=32) ==="
     python3 euler2ai_verify.py \
         --input ~/cmf_pcfs.json \
-        --depth 2000 --K 64 --max-tasks 0 \
+        --depth 2000 --K 32 --max-tasks 0 \
         --output ~/cmf_pcfs_report.csv
 fi
 

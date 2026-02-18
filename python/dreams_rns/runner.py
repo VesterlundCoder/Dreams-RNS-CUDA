@@ -23,7 +23,7 @@ from .compiler import CmfProgram, CmfCompiler, Opcode
 @dataclass
 class WalkConfig:
     """Configuration for walk execution."""
-    K: int = 64                     # Number of RNS primes (64 × 31-bit ≈ 1984 bits)
+    K: int = 32                     # Number of RNS primes (32 × 31-bit ≈ 992 bits)
     depth: int = 2000               # Walk depth (number of matrix multiplications)
     delta_threshold: float = -2.0   # Minimum delta for reporting
 
