@@ -256,6 +256,7 @@ def main():
 
     # Cache: compiled programs and walk results per unique (a, b)
     walk_cache = {}
+    seen_pcfs = set()
 
     with open(args.output, 'w', newline='') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -418,17 +419,17 @@ def main():
                 'K': K_use,
             })
 
-            # Progress — print every unique PCF (not every source)
-            if pcf_key not in {(t['a'], t['b']) for t in tasks[:ti]}:
-                elapsed = time.time() - t0
-                status = "MATCH" if is_match else "MISS"
-                delta_show = f"{delta_cuda:.5f}" if math.isfinite(delta_cuda) else str(delta_cuda)
-                ref_show = f"{delta_ref:.5f}" if delta_ref is not None else "N/A"
-                n_src = sum(1 for t in tasks if (t['a'], t['b']) == pcf_key)
-                print(f"  [{ti+1:>5}/{len(tasks)}] {status} "
-                      f"δ_cuda={delta_show:>10} δ_ref={ref_show:>10} "
-                      f"[{delta_method}] K={K_use} est={est:.8f} "
-                      f"({elapsed:.1f}s) {n_src}src a={a_str[:40]}")
+            # Progress
+            elapsed = time.time() - t0
+            status = "MATCH" if is_match else "MISS "
+            delta_show = f"{delta_cuda:.5f}" if math.isfinite(delta_cuda) else str(delta_cuda)
+            ref_show = f"{delta_ref:.5f}" if delta_ref is not None else "N/A"
+            cached_tag = " (cached)" if pcf_key in seen_pcfs else ""
+            seen_pcfs.add(pcf_key)
+            print(f"  [{ti+1:>5}/{len(tasks)}] {status} "
+                  f"δ_cuda={delta_show:>10} δ_ref={ref_show:>10} "
+                  f"diff={diff:.6f} [{delta_method}] K={K_use} "
+                  f"({elapsed:.1f}s){cached_tag} a={a_str[:40]}")
 
     elapsed_total = time.time() - t_global
 
