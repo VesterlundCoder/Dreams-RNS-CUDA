@@ -257,6 +257,8 @@ def main():
                         help="mpmath decimal precision (0 = auto from depth)")
     parser.add_argument("--max-cmfs", type=int, default=0,
                         help="Max CMFs to process (0=all)")
+    parser.add_argument("--cmf-name", type=str, default="",
+                        help="Process only the CMF with this name, e.g. zeta_5")
     parser.add_argument("--output", type=str, default="odd_zeta_exact_results/",
                         help="Output directory")
     args = parser.parse_args()
@@ -282,7 +284,12 @@ def main():
             if line:
                 specs.append(json.loads(line))
 
-    if args.max_cmfs > 0:
+    if args.cmf_name:
+        specs = [s for s in specs if s['name'] == args.cmf_name]
+        if not specs:
+            print(f"ERROR: no CMF named '{args.cmf_name}' found")
+            sys.exit(1)
+    elif args.max_cmfs > 0:
         specs = specs[:args.max_cmfs]
 
     n_tasks_per_cmf = len(args.shifts) * len(args.trajectories)

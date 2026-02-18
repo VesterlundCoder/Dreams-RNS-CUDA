@@ -266,8 +266,8 @@ def main():
     )
     parser.add_argument("--specs", type=str, required=True,
                         help="CMF specs JSONL from odd_zeta_cmf_generator.py")
-    parser.add_argument("--depth", type=int, default=5000,
-                        help="Walk depth (default 5000)")
+    parser.add_argument("--depth", type=int, default=1000,
+                        help="Walk depth (default 1000 for sweep; use odd_zeta_exact.py for deep)")
     parser.add_argument("--shifts", type=int, default=512,
                         help="Number of shifts (k starts at 1, 2, ..., shifts)")
     parser.add_argument("--trajectories", type=int, nargs='+', default=[1],
@@ -278,6 +278,10 @@ def main():
                         help="mpmath decimal precision for delta computation")
     parser.add_argument("--max-cmfs", type=int, default=0,
                         help="Max CMFs to process (0=all)")
+    parser.add_argument("--skip-cmfs", type=int, default=0,
+                        help="Skip first N CMFs (use with --max-cmfs 1 for per-CMF runs)")
+    parser.add_argument("--cmf-name", type=str, default="",
+                        help="Process only the CMF with this name, e.g. zeta_5")
     parser.add_argument("--output", type=str, default="odd_zeta_results/",
                         help="Output directory")
     args = parser.parse_args()
@@ -296,8 +300,16 @@ def main():
             if line:
                 specs.append(json.loads(line))
 
-    if args.max_cmfs > 0:
-        specs = specs[:args.max_cmfs]
+    if args.cmf_name:
+        specs = [s for s in specs if s['name'] == args.cmf_name]
+        if not specs:
+            print(f"ERROR: no CMF named '{args.cmf_name}' found")
+            sys.exit(1)
+    else:
+        if args.skip_cmfs > 0:
+            specs = specs[args.skip_cmfs:]
+        if args.max_cmfs > 0:
+            specs = specs[:args.max_cmfs]
 
     n_tasks_per_cmf = args.shifts * len(args.trajectories)
     print(f"\nOdd-Zeta CMF Sweep — RNS walk (GPU-scalable)")
