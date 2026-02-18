@@ -207,10 +207,17 @@ def main():
                 p_bits = Mp.bit_length()
                 elapsed = time.time() - t0
 
-                # Compare with reference
+                # Compare with reference — adaptive tolerance
+                # Slowly-converging PCFs (δ_ref < 0) need wider tolerance at
+                # finite depth because δ_computed ≈ δ_true - C/depth.
                 if delta_ref is not None and math.isfinite(delta_cuda):
                     diff = abs(delta_cuda - delta_ref)
-                    is_match = diff < args.delta_tol
+                    tol = args.delta_tol
+                    if delta_ref < -0.5:
+                        tol = max(tol, 1.0)    # very slow convergence
+                    elif delta_ref < 0:
+                        tol = max(tol, 0.2)    # moderate convergence
+                    is_match = diff < tol
                 else:
                     diff = float('nan')
                     is_match = False
@@ -246,9 +253,16 @@ def main():
                 status = "MATCH" if is_match else "MISS"
                 delta_show = f"{delta_cuda:.5f}" if math.isfinite(delta_cuda) else str(delta_cuda)
                 ref_show = f"{delta_ref:.5f}" if delta_ref is not None else "N/A"
+                # Show convergence class
+                if delta_ref is not None and delta_ref < -0.5:
+                    conv_class = "slow"
+                elif delta_ref is not None and delta_ref < 0:
+                    conv_class = "med"
+                else:
+                    conv_class = "fast"
                 print(f"  [{pi+1:>5}/{len(records)}] {status} "
                       f"δ_cuda={delta_show:>10} δ_ref={ref_show:>10} "
-                      f"diff={diff:.6f} est={est:.8f} "
+                      f"diff={diff:.6f} [{conv_class}] est={est:.8f} "
                       f"({elapsed:.1f}s) {len(sources)}src a={a_str[:40]}")
 
             except Exception as e:
