@@ -32,7 +32,6 @@ Thumbs.db
 
 # Results / generated data
 *.csv
-sweep_data/
 results/
 
 # Logs
