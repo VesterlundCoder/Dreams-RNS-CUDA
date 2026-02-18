@@ -114,6 +114,65 @@ def compute_initial_state(n: int) -> List[Fraction]:
     return v
 
 
+# ── Sphere coverage: auto-scale with dimensionality ─────────────────
+
+def compute_sphere_coverage(dim: int, budget: int) -> Tuple[int, int]:
+    """Compute (n_traj, n_shifts) to cover a D-dimensional sphere within budget.
+
+    Enumerable directions on a D-dim sphere:
+      Layer 1 (single-axis):  D × 10 mults = 10D
+      Layer 2 (two-axis):     C(D,2) × 25 pairs = ~12.5 D²
+      Layer 3 (three-axis):   C(D,3) × 27 triples (capped)
+
+    Shifts need fewer (shifts modulate starting point, not direction):
+      Layer 1: D × 10 offsets
+      Layer 2: C(D,2) × 9 pairs
+
+    Budget is a HARD CAP: n_traj × n_shifts <= budget.
+    Trajectories get ~80% of sqrt-budget, shifts get ~20%.
+    """
+    import math as _m
+
+    # Max enumerable per type
+    traj_L1 = 1 + dim * 10                       # single-axis: complete
+    traj_L2 = dim * (dim - 1) // 2 * 25          # two-axis pairs
+    traj_L3 = dim * (dim - 1) * (dim - 2) // 6 * 27  # three-axis
+    traj_full = traj_L1 + traj_L2 + traj_L3
+
+    shift_L1 = 1 + dim * 10
+    shift_L2 = dim * (dim - 1) // 2 * 9
+    shift_full = shift_L1 + shift_L2
+
+    # Strategy: trajectories scale with O(D²) to cover pair directions on
+    # the sphere; shifts get the remaining budget.
+    #
+    # Target traj: max(L1, 5·D²) — covers all single-axis + many pairs
+    # Target shifts: budget / n_traj — whatever is left
+    # Both capped at their enumerable maximum.
+
+    traj_target = max(traj_L1, 5 * dim * dim)
+    n_traj = min(traj_full, traj_target)
+
+    if budget <= n_traj:
+        # Budget too small for target — all to traj, 1 shift
+        return min(budget, traj_full), 1
+
+    n_shifts = max(1, min(shift_full, budget // n_traj))
+
+    # If shifts are saturated and budget remains, pour rest into traj
+    if n_shifts >= shift_full:
+        n_shifts = shift_full
+        n_traj = min(traj_full, budget // n_shifts)
+
+    # Hard cap
+    while n_traj * n_shifts > budget and n_shifts > 1:
+        n_shifts -= 1
+    while n_traj * n_shifts > budget and n_traj > 1:
+        n_traj -= 1
+
+    return n_traj, n_shifts
+
+
 # ── Multi-dim trajectory generation ────────────────────────────────────
 
 # Perturbation multipliers for trajectory exploration
@@ -130,89 +189,74 @@ def generate_trajectory_vectors(
     default_dirs: List[int],
     n_traj: int,
 ) -> List[List[Fraction]]:
-    """Generate n_traj trajectory vectors in dim-dimensional space.
+    """Generate trajectory vectors covering a D-dim sphere around default_dirs.
 
-    Strategy:
-      1. Standard trajectory (default_dirs)
-      2. Single-axis perturbations: scale one axis by rational multipliers
-      3. Two-axis perturbations: scale pairs of axes
-      4. Fill remaining with more combinations
+    Systematic enumeration in layers:
+      Layer 0: standard trajectory (1 vector)
+      Layer 1: single-axis perturbations (D × 10 vectors)
+      Layer 2: two-axis perturbations (C(D,2) × 25 vectors)
+      Layer 3: three-axis perturbations (C(D,3) × 27 vectors)
 
-    Returns list of Fraction vectors, each of length dim.
+    Generates ALL vectors in each layer before moving to the next,
+    ensuring uniform sphere coverage up to n_traj.
     """
     base = [Fraction(d) for d in default_dirs]
-    trajs = [list(base)]  # index 0 = standard
+    trajs = [list(base)]
     seen = {_vec_key(base)}
 
-    # Phase 1: single-axis perturbations
+    def _try_add(vec):
+        if len(trajs) >= n_traj:
+            return False
+        key = _vec_key(vec)
+        if key not in seen:
+            trajs.append(vec)
+            seen.add(key)
+        return True
+
+    # Layer 1: ALL single-axis perturbations (complete sphere axes)
     for axis in range(dim):
         for mult in TRAJ_MULTIPLIERS:
-            if len(trajs) >= n_traj:
-                break
             vec = list(base)
             vec[axis] = base[axis] * mult
-            key = _vec_key(vec)
-            if key not in seen:
-                trajs.append(vec)
-                seen.add(key)
-
-    # Phase 2: two-axis perturbations
-    for a1 in range(dim):
-        for a2 in range(a1 + 1, dim):
-            for m1 in TRAJ_MULTIPLIERS[:5]:
-                for m2 in TRAJ_MULTIPLIERS[:5]:
-                    if len(trajs) >= n_traj:
-                        break
-                    vec = list(base)
-                    vec[a1] = base[a1] * m1
-                    vec[a2] = base[a2] * m2
-                    key = _vec_key(vec)
-                    if key not in seen:
-                        trajs.append(vec)
-                        seen.add(key)
-                if len(trajs) >= n_traj:
-                    break
-            if len(trajs) >= n_traj:
+            if not _try_add(vec) and len(trajs) >= n_traj:
                 break
-        if len(trajs) >= n_traj:
-            break
 
-    # Phase 3: three-axis perturbations if still room
+    # Layer 2: ALL two-axis perturbations
     if len(trajs) < n_traj:
-        for a1 in range(min(dim, 6)):
-            for a2 in range(a1 + 1, min(dim, 8)):
-                for a3 in range(a2 + 1, min(dim, 10)):
+        for a1 in range(dim):
+            for a2 in range(a1 + 1, dim):
+                for m1 in TRAJ_MULTIPLIERS[:5]:
+                    for m2 in TRAJ_MULTIPLIERS[:5]:
+                        vec = list(base)
+                        vec[a1] = base[a1] * m1
+                        vec[a2] = base[a2] * m2
+                        if not _try_add(vec):
+                            pass
+                        if len(trajs) >= n_traj:
+                            return trajs[:n_traj]
+
+    # Layer 3: ALL three-axis perturbations (full dim, no caps)
+    if len(trajs) < n_traj:
+        for a1 in range(dim):
+            for a2 in range(a1 + 1, dim):
+                for a3 in range(a2 + 1, dim):
                     for m1 in TRAJ_MULTIPLIERS[:3]:
                         for m2 in TRAJ_MULTIPLIERS[:3]:
                             for m3 in TRAJ_MULTIPLIERS[:3]:
-                                if len(trajs) >= n_traj:
-                                    break
                                 vec = list(base)
                                 vec[a1] = base[a1] * m1
                                 vec[a2] = base[a2] * m2
                                 vec[a3] = base[a3] * m3
-                                key = _vec_key(vec)
-                                if key not in seen:
-                                    trajs.append(vec)
-                                    seen.add(key)
-                            if len(trajs) >= n_traj:
-                                break
-                        if len(trajs) >= n_traj:
-                            break
-                    if len(trajs) >= n_traj:
-                        break
-                if len(trajs) >= n_traj:
-                    break
-            if len(trajs) >= n_traj:
-                break
+                                _try_add(vec)
+                                if len(trajs) >= n_traj:
+                                    return trajs[:n_traj]
 
     return trajs[:n_traj]
 
 
-# ── Multi-dim shift generation ─────────────────────────────────────────
+# ── Multi-dim shift generation ─────────────────────────────────────
 
 SHIFT_OFFSETS = [
-    Fraction(0),
     Fraction(1), Fraction(-1),
     Fraction(1, 2), Fraction(-1, 2),
     Fraction(1, 3), Fraction(-1, 3),
@@ -226,51 +270,46 @@ def generate_shift_vectors(
     default_shifts: List[int],
     n_shifts: int,
 ) -> List[List[Fraction]]:
-    """Generate n_shifts shift vectors in dim-dimensional space.
+    """Generate shift vectors covering a D-dim sphere around default_shifts.
 
-    Strategy:
-      1. Standard shift (default_shifts)
-      2. Single-axis offsets: add ±1/d to one axis
-      3. Two-axis offsets
+    Layers:
+      Layer 0: standard shift (1 vector)
+      Layer 1: single-axis offsets (D × 10 vectors)
+      Layer 2: two-axis offsets (C(D,2) × 9 vectors)
     """
     base = [Fraction(s) for s in default_shifts]
     shifts = [list(base)]
     seen = {_vec_key(base)}
 
-    # Single-axis offsets
+    def _try_add(vec):
+        if len(shifts) >= n_shifts:
+            return False
+        key = _vec_key(vec)
+        if key not in seen:
+            shifts.append(vec)
+            seen.add(key)
+        return True
+
+    # Layer 1: ALL single-axis offsets
     for axis in range(dim):
         for offset in SHIFT_OFFSETS:
-            if offset == 0:
-                continue
-            if len(shifts) >= n_shifts:
-                break
             vec = list(base)
             vec[axis] = base[axis] + offset
-            key = _vec_key(vec)
-            if key not in seen:
-                shifts.append(vec)
-                seen.add(key)
+            _try_add(vec)
 
-    # Two-axis offsets
-    for a1 in range(dim):
-        for a2 in range(a1 + 1, dim):
-            for o1 in SHIFT_OFFSETS[1:4]:
-                for o2 in SHIFT_OFFSETS[1:4]:
-                    if len(shifts) >= n_shifts:
-                        break
-                    vec = list(base)
-                    vec[a1] = base[a1] + o1
-                    vec[a2] = base[a2] + o2
-                    key = _vec_key(vec)
-                    if key not in seen:
-                        shifts.append(vec)
-                        seen.add(key)
-                if len(shifts) >= n_shifts:
-                    break
-            if len(shifts) >= n_shifts:
-                break
-        if len(shifts) >= n_shifts:
-            break
+    # Layer 2: ALL two-axis offsets
+    if len(shifts) < n_shifts:
+        pair_offsets = [Fraction(1), Fraction(-1), Fraction(1, 2)]
+        for a1 in range(dim):
+            for a2 in range(a1 + 1, dim):
+                for o1 in pair_offsets:
+                    for o2 in pair_offsets:
+                        vec = list(base)
+                        vec[a1] = base[a1] + o1
+                        vec[a2] = base[a2] + o2
+                        _try_add(vec)
+                        if len(shifts) >= n_shifts:
+                            return shifts[:n_shifts]
 
     return shifts[:n_shifts]
 
@@ -315,10 +354,12 @@ def main():
                         help="CMF specs JSONL from odd_zeta_cmf_generator.py")
     parser.add_argument("--depth", type=int, default=1000,
                         help="Walk depth (default 1000)")
-    parser.add_argument("--n-shifts", type=int, default=50,
-                        help="Number of multi-dim shift vectors to generate")
-    parser.add_argument("--n-traj", type=int, default=1000,
-                        help="Number of multi-dim trajectory vectors to generate")
+    parser.add_argument("--budget", type=int, default=50000,
+                        help="Max walks per CMF. Auto-scales shifts/traj with dim.")
+    parser.add_argument("--n-shifts", type=int, default=0,
+                        help="Override shift count (0=auto from budget+dim)")
+    parser.add_argument("--n-traj", type=int, default=0,
+                        help="Override traj count (0=auto from budget+dim)")
     parser.add_argument("--K", type=int, default=16,
                         help="RNS primes (default 16; float shadow is primary)")
     parser.add_argument("--dps", type=int, default=50,
@@ -360,13 +401,18 @@ def main():
 
     print(f"\nOdd-Zeta CMF Sweep — compiled RNS, multi-dimensional")
     print(f"  CMFs:        {len(specs)}")
-    print(f"  Shift vecs:  {args.n_shifts}")
-    print(f"  Traj vecs:   {args.n_traj}")
-    print(f"  Tasks/CMF:   {args.n_shifts * args.n_traj}")
+    print(f"  Budget/CMF:  {args.budget} walks")
     print(f"  Depth:       {args.depth}")
     print(f"  K:           {args.K}")
     print(f"  Constants:   {len(constants)}")
     print(f"  Resume:      {args.resume}")
+    # Show per-CMF scaling
+    for s in specs:
+        d = s['dim']
+        nt, ns = compute_sphere_coverage(d, args.budget)
+        if args.n_traj > 0: nt = args.n_traj
+        if args.n_shifts > 0: ns = args.n_shifts
+        print(f"    {s['name']:>10}: dim={d:>2} → {ns} shifts × {nt} traj = {ns*nt} walks")
     print(f"{'='*80}")
 
     os.makedirs(args.output, exist_ok=True)
@@ -406,12 +452,20 @@ def main():
                 print(f"  COMPILE ERROR: {e}")
                 continue
 
-            # Generate multi-dim shift and trajectory vectors
-            shift_vecs = generate_shift_vectors(dim, default_shifts, args.n_shifts)
-            traj_vecs = generate_trajectory_vectors(dim, default_dirs, args.n_traj)
+            # Auto-scale shifts/traj based on dim and budget
+            auto_nt, auto_ns = compute_sphere_coverage(dim, args.budget)
+            nt = args.n_traj if args.n_traj > 0 else auto_nt
+            ns = args.n_shifts if args.n_shifts > 0 else auto_ns
+
+            shift_vecs = generate_shift_vectors(dim, default_shifts, ns)
+            traj_vecs = generate_trajectory_vectors(dim, default_dirs, nt)
             print(f"  Generated {len(shift_vecs)} shift vecs × "
                   f"{len(traj_vecs)} traj vecs = "
-                  f"{len(shift_vecs) * len(traj_vecs)} walks")
+                  f"{len(shift_vecs) * len(traj_vecs)} walks "
+                  f"(dim={dim}, budget={args.budget})")
+            print(f"  Sphere coverage: L1={dim*10} axis, "
+                  f"L2={dim*(dim-1)//2} pairs, "
+                  f"L3={dim*(dim-1)*(dim-2)//6} triples")
 
             t_cmf_start = time.time()
             cmf_new = 0

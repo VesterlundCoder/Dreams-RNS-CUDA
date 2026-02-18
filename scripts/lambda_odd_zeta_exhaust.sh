@@ -23,14 +23,12 @@ PYDIR=~/Dreams-RNS-CUDA/python
 RESULTS=~/results_odd_zeta
 DEPTH=1000
 K=16
-N_SHIFTS=50
-N_TRAJ=1000
+BUDGET=50000
 
 echo "============================================================"
 echo "  Odd-Zeta Exhaustive Sweep — A100"
-echo "  Depth=${DEPTH}, K=${K}"
-echo "  ${N_SHIFTS} multi-dim shift vectors"
-echo "  ${N_TRAJ} multi-dim trajectory vectors"
+echo "  Depth=${DEPTH}, K=${K}, Budget=${BUDGET}/CMF"
+echo "  Auto-scales shifts/traj per CMF dim (sphere coverage)"
 echo "  Results: ${RESULTS}"
 echo "============================================================"
 
@@ -71,7 +69,7 @@ for CMF_NAME in ${CMFS}; do
     echo ""
     echo "============================================================"
     echo "  [${CMF_NUM}/${TOTAL_CMFS}] ${CMF_NAME}"
-    echo "  ${N_SHIFTS} shift vecs × ${N_TRAJ} traj vecs = $((N_SHIFTS * N_TRAJ)) walks"
+    echo "  Budget: ${BUDGET} walks (auto-scaled to dim)"
     echo "  Output: ${OUT}/"
     echo "============================================================"
 
@@ -80,8 +78,7 @@ for CMF_NAME in ${CMFS}; do
         --cmf-name "${CMF_NAME}" \
         --depth ${DEPTH} \
         --K ${K} \
-        --n-shifts ${N_SHIFTS} \
-        --n-traj ${N_TRAJ} \
+        --budget ${BUDGET} \
         --output "${OUT}/" \
         --resume
 
