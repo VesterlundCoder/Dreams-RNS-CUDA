@@ -25,6 +25,7 @@ import numpy as np
 
 from .compiler import CmfProgram, Opcode
 from .runner import generate_rns_primes, _eval_bytecode_float
+from .cmf_walk import _eval_bytecode_float_multiaxis
 
 # ── cupy detection ───────────────────────────────────────────────────────
 
@@ -147,6 +148,105 @@ def _eval_bytecode_batch_gpu(program: CmfProgram, step: int,
             M[row, col] = regs[r] % pp
 
     return M
+
+
+def _eval_bytecode_batch_gpu_multiaxis(program: CmfProgram, step: int,
+                                       shift_vals_gpu, pp_gpu, const_table_gpu):
+    """Evaluate bytecode for B walks × K primes with per-axis shifts.
+
+    Args:
+        shift_vals_gpu: cupy (B, dim) int64 — per-axis shift per walk
+        pp_gpu:         cupy (K,) int64
+        const_table_gpu: cupy (n_constants, K) int64
+
+    Returns:
+        cupy (m, m, B, K) int64 — batched M matrices
+    """
+    cp = _cp
+    m = program.m
+    B = shift_vals_gpu.shape[0]
+    K = len(pp_gpu)
+    pp = pp_gpu.reshape(1, K)
+
+    max_reg = 0
+    for instr in program.opcodes:
+        if instr.op == Opcode.END:
+            break
+        for a in [getattr(instr, f'arg{i}', 0) for i in range(3)]:
+            if a is not None and isinstance(a, int):
+                max_reg = max(max_reg, a)
+    n_regs = max_reg + 1
+
+    regs = [None] * n_regs
+    M = cp.zeros((m, m, B, K), dtype=cp.int64)
+
+    for instr in program.opcodes:
+        op = instr.op
+        if op == Opcode.END:
+            break
+        elif op == Opcode.LOAD_X:
+            axis, dest = instr.arg0, instr.arg1
+            # shift_vals_gpu[:, axis] is (B,), reshape to (B, 1) for broadcast
+            vals = shift_vals_gpu[:, axis].reshape(B, 1) + cp.int64(step * program.directions[axis])
+            regs[dest] = vals % pp
+        elif op == Opcode.LOAD_C:
+            idx, dest = instr.arg0, instr.arg1
+            regs[dest] = cp.broadcast_to(const_table_gpu[idx:idx+1], (B, K)).copy()
+        elif op == Opcode.LOAD_N:
+            dest = instr.arg0
+            regs[dest] = cp.full((B, K), step, dtype=cp.int64) % pp
+        elif op == Opcode.ADD:
+            r1, r2, dest = instr.arg0, instr.arg1, instr.arg2
+            regs[dest] = (regs[r1] + regs[r2]) % pp
+        elif op == Opcode.SUB:
+            r1, r2, dest = instr.arg0, instr.arg1, instr.arg2
+            regs[dest] = (regs[r1] - regs[r2]) % pp
+        elif op == Opcode.MUL:
+            r1, r2, dest = instr.arg0, instr.arg1, instr.arg2
+            regs[dest] = (regs[r1] * regs[r2]) % pp
+        elif op == Opcode.NEG:
+            r, dest = instr.arg0, instr.arg1
+            regs[dest] = (pp - regs[r]) % pp
+        elif op == Opcode.POW2:
+            r, dest = instr.arg0, instr.arg1
+            regs[dest] = (regs[r] * regs[r]) % pp
+        elif op == Opcode.POW3:
+            r, dest = instr.arg0, instr.arg1
+            regs[dest] = (regs[r] * regs[r] % pp * regs[r]) % pp
+        elif op == Opcode.INV:
+            r, dest = instr.arg0, instr.arg1
+            vals_cpu = regs[r].get()
+            pp_cpu = pp_gpu.get()
+            inv_cpu = np.empty_like(vals_cpu)
+            for bi in range(B):
+                for ki in range(K):
+                    v = int(vals_cpu[bi, ki])
+                    p = int(pp_cpu[ki])
+                    inv_cpu[bi, ki] = pow(v, p - 2, p) if v != 0 else 0
+            regs[dest] = cp.asarray(inv_cpu)
+        elif op == Opcode.STORE:
+            r, row, col = instr.arg0, instr.arg1, instr.arg2
+            M[row, col] = regs[r] % pp
+
+    return M
+
+
+def _matmul_rxr_batch_mod_gpu(A, B, pp, r):
+    """Batched modular r×r matmul: A @ B mod pp.
+
+    A, B: (r, r, batch, K) int64 on GPU
+    pp:   (1, K) int64 on GPU
+    Returns: (r, r, batch, K) int64
+    """
+    cp = _cp
+    C = cp.zeros_like(A)
+    for i in range(r):
+        for j in range(r):
+            acc = cp.zeros(A.shape[2:], dtype=cp.int64)  # (batch, K)
+            for k in range(r):
+                acc = (acc + A[i, k] * B[k, j]) % pp
+            C[i, j] = acc
+    return C
 
 
 def _matmul_2x2_batch_mod_gpu(A, B, pp):
@@ -274,6 +374,116 @@ def run_pcf_walk_batch_gpu(
                 'log_scale': log_scale,
                 'primes': pp_np,
                 'shift_val': batch_sv[bi],
+            })
+
+    return all_results
+
+
+# ── r×r CMF GPU walk (general rank, multi-axis shifts) ───────────────────
+
+def run_cmf_walk_gpu(
+    program: CmfProgram,
+    depth: int,
+    K: int,
+    shift_vals: List[int],
+) -> Dict[str, Any]:
+    """GPU-accelerated single CMF walk. Same interface as cmf_walk.run_cmf_walk."""
+    results = run_cmf_walk_batch_gpu(program, depth, K, [shift_vals])
+    return results[0]
+
+
+def run_cmf_walk_batch_gpu(
+    program: CmfProgram,
+    depth: int,
+    K: int = 32,
+    shift_val_list: Optional[List[List[int]]] = None,
+    batch_size: int = 128,
+) -> List[Dict[str, Any]]:
+    """Run B r×r CMF walks in parallel on GPU, each with per-axis shifts.
+
+    The RNS walk (exact integer arithmetic mod K primes) runs entirely
+    on GPU. A single float64 shadow is maintained on CPU for the first
+    walk to provide approximate convergent estimates.
+
+    Args:
+        program:        compiled CmfProgram (any rank r)
+        depth:          walk depth
+        K:              number of RNS primes
+        shift_val_list: list of per-axis shift vectors, each len=dim
+        batch_size:     max simultaneous walks per GPU batch
+
+    Returns:
+        List of result dicts, one per shift vector:
+          p_residues, q_residues: (K,) int64 arrays
+          p_float, q_float: float64 estimates (from representative shadow)
+          log_scale: float64 accumulated log-normalization
+          primes: (K,) int64 array
+          shift_vals: the shift vector used
+    """
+    if not _ensure_cupy():
+        from .cmf_walk import run_cmf_walk
+        return [run_cmf_walk(program, depth, K, sv) for sv in shift_val_list]
+
+    cp = _cp
+    r = program.m
+    dim = program.dim
+
+    if shift_val_list is None:
+        shift_val_list = [[1] * dim]
+
+    pp_np = generate_rns_primes(K).astype(np.int64)
+    pp_gpu = cp.asarray(pp_np)
+    pp_bcast = pp_gpu.reshape(1, K)
+
+    const_table_gpu = _precompute_const_residues_gpu(program, pp_np)
+
+    all_results = []
+
+    for batch_start in range(0, len(shift_val_list), batch_size):
+        batch_svs = shift_val_list[batch_start : batch_start + batch_size]
+        B = len(batch_svs)
+
+        # (B, dim) shift matrix on GPU
+        sv_np = np.array(batch_svs, dtype=np.int64)  # (B, dim)
+        sv_gpu = cp.asarray(sv_np)
+
+        # GPU: P_rns shape (r, r, B, K) initialised to identity
+        P_rns = cp.zeros((r, r, B, K), dtype=cp.int64)
+        for i in range(r):
+            P_rns[i, i] = cp.ones((B, K), dtype=cp.int64)
+
+        # CPU: single representative float shadow (first shift in batch)
+        P_f = np.eye(r, dtype=np.float64)
+        log_scale = 0.0
+
+        for step in range(depth):
+            # GPU: evaluate M(n) for all B shifts × K primes at once
+            M_rns = _eval_bytecode_batch_gpu_multiaxis(
+                program, step, sv_gpu, pp_gpu, const_table_gpu)
+
+            # GPU: batched r×r modular matmul
+            P_rns = _matmul_rxr_batch_mod_gpu(P_rns, M_rns, pp_bcast, r)
+
+            # CPU: float shadow for approximate estimate (only 1 representative)
+            M_f = _eval_bytecode_float_multiaxis(program, step, list(batch_svs[0]))
+            P_f = P_f @ M_f
+            mx = np.max(np.abs(P_f))
+            if mx > 1e10:
+                P_f /= mx
+                log_scale += math.log(mx)
+
+        # Transfer RNS results back to CPU
+        P_cpu = P_rns.get()  # (r, r, B, K) on CPU
+
+        for bi in range(B):
+            all_results.append({
+                'p_residues': P_cpu[0, r - 1, bi],
+                'q_residues': P_cpu[r - 1, r - 1, bi],
+                'p_float': float(P_f[0, r - 1]),
+                'q_float': float(P_f[r - 1, r - 1]),
+                'log_scale': log_scale,
+                'primes': pp_np,
+                'shift_vals': list(batch_svs[bi]),
             })
 
     return all_results

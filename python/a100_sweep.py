@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dreams_rns import compile_pcf, pcf_initial_values, run_pcf_walk
 from dreams_rns import crt_reconstruct, centered
-from dreams_rns.gpu_walk import gpu_available, run_pcf_walk_batch_gpu
+from dreams_rns.gpu_walk import gpu_available, run_pcf_walk_batch_gpu, run_cmf_walk_batch_gpu
 from dreams_rns.cmf_walk import compile_cmf_spec, run_cmf_walk, shift_to_axis_offsets
 from dreams_rns.constants import (
     load_constants, match_against_constants, compute_delta_against_constant,
@@ -238,7 +238,8 @@ def run_cmf_sweep_mode(args, constants):
     """Run CMF sweep: all specs × trajectories × shifts.
 
     Uses the full r×r companion matrix walk with per-axis variables.
-    Each (CMF, trajectory) pair is compiled once, then walked with each shift.
+    Each (CMF, trajectory) pair is compiled once, then ALL shifts are
+    walked in a single GPU batch for maximum throughput.
 
     For 3F2 (rank=4, dim=5): 1000 CMFs × 8161 traj × 512 shifts = 4.18B walks
     For a quick first pass: use --max-traj to limit trajectories.
@@ -259,6 +260,9 @@ def run_cmf_sweep_mode(args, constants):
     n_shifts = len(shifts)
     total_walks = n_cmfs * n_traj * n_shifts
 
+    use_gpu = gpu_available()
+    backend = "GPU (CuPy)" if use_gpu else "CPU (numpy)"
+
     print(f"CMF Sweep Configuration:")
     print(f"  CMFs:          {n_cmfs}")
     print(f"  Trajectories:  {n_traj}")
@@ -266,6 +270,7 @@ def run_cmf_sweep_mode(args, constants):
     print(f"  Total walks:   {total_walks:,}")
     print(f"  Constants:     {len(constants)}")
     print(f"  Depth={args.depth}, K={args.K}")
+    print(f"  Backend:       {backend}")
     print(f"  Proximity:     {args.proximity}")
     print(f"{'='*80}")
 
@@ -282,6 +287,14 @@ def run_cmf_sweep_mode(args, constants):
         cmf_hits = 0
         t_cmf = time.time()
 
+        # Pre-compute all shift offset vectors once
+        all_shift_offsets = []
+        for shift in shifts:
+            so = shift_to_axis_offsets(shift, spec['p'])
+            while len(so) < dim:
+                so.append(1)
+            all_shift_offsets.append(so[:dim])
+
         for ti, traj in enumerate(trajs):
             # Compile once per (CMF, trajectory) pair
             try:
@@ -289,22 +302,26 @@ def run_cmf_sweep_mode(args, constants):
                 if program is None:
                     run_count += n_shifts
                     continue
-            except Exception as e:
+            except Exception:
                 run_count += n_shifts
                 continue
 
-            # Walk with each shift
-            for si, shift in enumerate(shifts):
+            # Batch ALL shifts through GPU walker at once
+            try:
+                results = run_cmf_walk_batch_gpu(
+                    program, args.depth, args.K,
+                    shift_val_list=all_shift_offsets,
+                    batch_size=getattr(args, 'batch_size', 128),
+                )
+            except Exception as e:
+                print(f"    WARN: batch walk failed for {name} traj {ti}: {e}")
+                run_count += n_shifts
+                continue
+
+            # Post-process each result
+            for si, res in enumerate(results):
                 run_count += 1
                 try:
-                    shift_offsets = shift_to_axis_offsets(shift, spec['p'])
-                    # Pad/truncate to dim if needed
-                    while len(shift_offsets) < dim:
-                        shift_offsets.append(1)
-                    shift_offsets = shift_offsets[:dim]
-
-                    res = run_cmf_walk(program, args.depth, args.K, shift_offsets)
-
                     primes = [int(p) for p in res['primes']]
                     p_big, Mp = crt_reconstruct(
                         [int(r) for r in res['p_residues']], primes)
@@ -353,7 +370,7 @@ def run_cmf_sweep_mode(args, constants):
                             'traj_idx': ti,
                             'traj': list(traj),
                             'shift_idx': si,
-                            'shift_offsets': shift_offsets,
+                            'shift_offsets': all_shift_offsets[si],
                             'est_float': est,
                             'best_const': best_const,
                             'best_delta': best_delta,
