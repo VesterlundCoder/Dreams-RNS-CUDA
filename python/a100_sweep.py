@@ -106,8 +106,9 @@ def run_euler2ai_mode(args, constants):
             a0 = pcf_initial_values(a_str)
 
             # Auto-K: estimate primes needed for exact CRT
-            K_use = args.K
-            if K_use <= 64:
+            if args.K > 0:
+                K_use = args.K
+            else:
                 from euler2ai_full_verify import estimate_K
                 K_use = estimate_K(a_str, b_str, args.depth)
 
@@ -317,7 +318,9 @@ def run_cmf_sweep_mode(args, constants):
     print(f"  Shifts:        {n_shifts}")
     print(f"  Total walks:   {total_walks:,}")
     print(f"  Constants:     {len(constants)}")
-    print(f"  Depth={args.depth}, K={args.K}")
+    # CMF mode: use explicit K or default to 1000 for general coverage
+    cmf_K = args.K if args.K > 0 else 1000
+    print(f"  Depth={args.depth}, K={cmf_K}")
     print(f"  Backend:       {backend}")
     print(f"  Proximity:     {args.proximity}")
     print(f"{'='*80}")
@@ -357,7 +360,7 @@ def run_cmf_sweep_mode(args, constants):
             # Batch ALL shifts through GPU walker at once
             try:
                 results = run_cmf_walk_batch_gpu(
-                    program, args.depth, args.K,
+                    program, args.depth, cmf_K,
                     shift_val_list=all_shift_offsets,
                     batch_size=getattr(args, 'batch_size', 128),
                 )
@@ -523,7 +526,8 @@ def main():
     parser.add_argument("--shifts", type=str, default=None,
                         help="Shifts JSON file (CMF mode only)")
     parser.add_argument("--depth", type=int, default=2000)
-    parser.add_argument("--K", type=int, default=32)
+    parser.add_argument("--K", type=int, default=0,
+                        help="RNS primes (0=auto per PCF for euler2ai mode)")
     parser.add_argument("--dps", type=int, default=200,
                         help="mpmath decimal precision")
     parser.add_argument("--proximity", type=float, default=1e-3,
