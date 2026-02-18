@@ -193,13 +193,16 @@ def _matmul_rxr_mod(A: np.ndarray, B: np.ndarray, pp: np.ndarray, r: int) -> np.
 def _eval_bytecode_allprimes_multiaxis(
     program: CmfProgram,
     step: int,
-    shift_vals: List[int],
+    shift_nums: List[int],
+    shift_dens: List[int],
+    inv_dens: List[np.ndarray],
     primes: np.ndarray,
     const_table: np.ndarray,
 ) -> np.ndarray:
     """Evaluate bytecode producing (m, m, K) matrix with per-axis shift values.
 
-    At LOAD_X for axis i: value = shift_vals[i] + step * direction[i]
+    Supports rational shifts: k = (shift_num + step * dir * shift_den) / shift_den
+    In modular arithmetic: k = (shift_num + step * dir * shift_den) * inv(shift_den) mod p
     """
     m = program.m
     K = len(primes)
@@ -214,8 +217,8 @@ def _eval_bytecode_allprimes_multiaxis(
             break
         elif op == Opcode.LOAD_X:
             axis, dest = instr.arg0, instr.arg1
-            val = np.int64(shift_vals[axis] + step * program.directions[axis])
-            regs[dest] = val % pp
+            k_num = shift_nums[axis] + step * program.directions[axis] * shift_dens[axis]
+            regs[dest] = (np.int64(k_num) % pp * inv_dens[axis]) % pp
         elif op == Opcode.LOAD_C:
             idx, dest = instr.arg0, instr.arg1
             regs[dest] = const_table[idx].copy()
@@ -255,7 +258,8 @@ def _eval_bytecode_allprimes_multiaxis(
 def _eval_bytecode_float_multiaxis(
     program: CmfProgram,
     step: int,
-    shift_vals: List[int],
+    shift_nums: List[int],
+    shift_dens: List[int],
 ) -> np.ndarray:
     """Evaluate bytecode producing (m, m) float64 matrix with per-axis shifts."""
     m = program.m
@@ -268,7 +272,8 @@ def _eval_bytecode_float_multiaxis(
             break
         elif op == Opcode.LOAD_X:
             axis, dest = instr.arg0, instr.arg1
-            regs[dest] = float(shift_vals[axis] + step * program.directions[axis])
+            k_num = shift_nums[axis] + step * program.directions[axis] * shift_dens[axis]
+            regs[dest] = float(k_num) / float(shift_dens[axis])
         elif op == Opcode.LOAD_C:
             idx, dest = instr.arg0, instr.arg1
             regs[dest] = float(program.constants[idx])
@@ -323,7 +328,7 @@ def run_cmf_walk(
     program: CmfProgram,
     depth: int,
     K: int,
-    shift_vals: List[int],
+    shift_vals,
 ) -> Dict[str, Any]:
     """Walk an r×r companion matrix with per-axis shift values.
 
@@ -331,7 +336,10 @@ def run_cmf_walk(
         program:    compiled CmfProgram (r×r, multi-axis)
         depth:      walk steps
         K:          number of RNS primes
-        shift_vals: per-axis starting offsets (len = program.dim)
+        shift_vals: per-axis starting offsets. Each element can be:
+                    - int: integer shift (backward compatible)
+                    - Fraction: rational shift (uses modular inverse)
+                    - tuple (num, den): rational shift as pair
 
     Returns:
         dict with p_residues, q_residues, p_float, q_float, log_scale, primes
@@ -339,6 +347,29 @@ def run_cmf_walk(
     r = program.m
     pp = generate_rns_primes(K).astype(np.int64)
     const_table = _precompute_const_residues(program, pp)
+
+    # Convert shift_vals to (numerator, denominator) pairs
+    shift_nums = []
+    shift_dens = []
+    for s in shift_vals:
+        if isinstance(s, Fraction):
+            shift_nums.append(s.numerator)
+            shift_dens.append(s.denominator)
+        elif isinstance(s, tuple):
+            shift_nums.append(s[0])
+            shift_dens.append(s[1])
+        else:
+            shift_nums.append(int(s))
+            shift_dens.append(1)
+
+    # Precompute modular inverses of denominators for each prime
+    inv_dens = []
+    for den in shift_dens:
+        if den == 1:
+            inv_dens.append(np.ones(len(pp), dtype=np.int64))
+        else:
+            inv_dens.append(np.array(
+                [pow(den, int(p) - 2, int(p)) for p in pp], dtype=np.int64))
 
     # RNS accumulator: P[i,j,k] = entry (i,j) mod prime k, init to identity
     P_rns = np.zeros((r, r, K), dtype=np.int64)
@@ -351,8 +382,9 @@ def run_cmf_walk(
 
     for step in range(depth):
         M_rns = _eval_bytecode_allprimes_multiaxis(
-            program, step, shift_vals, pp, const_table)
-        M_f = _eval_bytecode_float_multiaxis(program, step, shift_vals)
+            program, step, shift_nums, shift_dens, inv_dens, pp, const_table)
+        M_f = _eval_bytecode_float_multiaxis(
+            program, step, shift_nums, shift_dens)
 
         P_rns = _matmul_rxr_mod(P_rns, M_rns, pp, r)
 
@@ -373,6 +405,123 @@ def run_cmf_walk(
         'q_residues': q_res,
         'p_float': p_float,
         'q_float': q_float,
+        'log_scale': log_scale,
+        'primes': pp,
+    }
+
+
+# ── State-vector walk (matvec) ──────────────────────────────────────────
+
+def _matvec_mod(M: np.ndarray, v: np.ndarray, pp: np.ndarray, r: int) -> np.ndarray:
+    """Modular r×r matrix × r-vector: w = M @ v mod pp, vectorised over K primes."""
+    w = np.zeros_like(v)
+    for i in range(r):
+        for j in range(r):
+            w[i] = (w[i] + M[i, j] * v[j]) % pp
+    return w
+
+
+def run_cmf_walk_vec(
+    program: CmfProgram,
+    depth: int,
+    K: int,
+    shift_vals,
+    initial_state: List[Fraction],
+    acc_idx: int,
+    const_idx: int,
+) -> Dict[str, Any]:
+    """State-vector walk: v(N) = M(N-1) · ... · M(0) · v(0).
+
+    Uses matvec (not matmul) — more efficient for state-vector CMFs like
+    odd-zeta where the initial state has specific structure.
+
+    Supports rational shifts via modular inverse.  Initial state entries
+    can be Fractions; they are converted to RNS residues.
+
+    The float shadow gives ~15 digit matching precision, sufficient for
+    sweep filtering.  CRT is available when K is large enough.
+
+    Args:
+        program:       compiled CmfProgram
+        depth:         walk steps
+        K:             number of RNS primes
+        shift_vals:    per-axis shifts (int, Fraction, or (num,den) tuple)
+        initial_state: list of Fraction values for v(0)
+        acc_idx:       index of accumulator entry (p)
+        const_idx:     index of constant entry (q)
+
+    Returns:
+        dict with p_residues, q_residues, p_float, q_float, log_scale, primes
+    """
+    r = program.m
+    pp = generate_rns_primes(K).astype(np.int64)
+    const_table = _precompute_const_residues(program, pp)
+
+    # Convert shift_vals to (numerator, denominator) pairs
+    shift_nums = []
+    shift_dens = []
+    for s in shift_vals:
+        if isinstance(s, Fraction):
+            shift_nums.append(s.numerator)
+            shift_dens.append(s.denominator)
+        elif isinstance(s, tuple):
+            shift_nums.append(s[0])
+            shift_dens.append(s[1])
+        else:
+            shift_nums.append(int(s))
+            shift_dens.append(1)
+
+    # Precompute modular inverses of shift denominators
+    inv_dens = []
+    for den in shift_dens:
+        if den == 1:
+            inv_dens.append(np.ones(len(pp), dtype=np.int64))
+        else:
+            inv_dens.append(np.array(
+                [pow(den, int(p) - 2, int(p)) for p in pp], dtype=np.int64))
+
+    # Convert initial state (Fractions) to RNS residues
+    # v_rns[i, ki] = initial_state[i].numerator * inv(initial_state[i].denominator) mod prime[ki]
+    v_rns = np.zeros((r, K), dtype=np.int64)
+    for i in range(r):
+        f = initial_state[i]
+        if f == 0:
+            continue
+        num = f.numerator
+        den = f.denominator
+        for ki in range(K):
+            p = int(pp[ki])
+            n_mod = num % p if num >= 0 else (p - (-num % p)) % p
+            if den == 1:
+                v_rns[i, ki] = n_mod
+            else:
+                d_inv = pow(den, p - 2, p)
+                v_rns[i, ki] = (n_mod * d_inv) % p
+
+    # Float shadow
+    v_f = np.array([float(f) for f in initial_state], dtype=np.float64)
+    log_scale = 0.0
+
+    for step in range(depth):
+        M_rns = _eval_bytecode_allprimes_multiaxis(
+            program, step, shift_nums, shift_dens, inv_dens, pp, const_table)
+        M_f = _eval_bytecode_float_multiaxis(
+            program, step, shift_nums, shift_dens)
+
+        # v = M @ v (matvec, not matmul)
+        v_rns = _matvec_mod(M_rns, v_rns, pp, r)
+
+        v_f = M_f @ v_f
+        mx = np.max(np.abs(v_f))
+        if mx > 1e10:
+            v_f /= mx
+            log_scale += math.log(mx)
+
+    return {
+        'p_residues': v_rns[acc_idx],
+        'q_residues': v_rns[const_idx],
+        'p_float': v_f[acc_idx],
+        'q_float': v_f[const_idx],
         'log_scale': log_scale,
         'primes': pp,
     }
