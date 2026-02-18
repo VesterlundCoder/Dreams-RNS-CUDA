@@ -23,14 +23,14 @@ PYDIR=~/Dreams-RNS-CUDA/python
 RESULTS=~/results_odd_zeta
 DEPTH=1000
 K=16
-RATIONAL_SHIFTS=50
-MAX_TRAJ=1000
+N_SHIFTS=50
+N_TRAJ=1000
 
 echo "============================================================"
 echo "  Odd-Zeta Exhaustive Sweep — A100"
 echo "  Depth=${DEPTH}, K=${K}"
-echo "  ${RATIONAL_SHIFTS} rational shifts (±1/d)"
-echo "  ${MAX_TRAJ} trajectories per shift"
+echo "  ${N_SHIFTS} multi-dim shift vectors"
+echo "  ${N_TRAJ} multi-dim trajectory vectors"
 echo "  Results: ${RESULTS}"
 echo "============================================================"
 
@@ -71,7 +71,7 @@ for CMF_NAME in ${CMFS}; do
     echo ""
     echo "============================================================"
     echo "  [${CMF_NUM}/${TOTAL_CMFS}] ${CMF_NAME}"
-    echo "  ${RATIONAL_SHIFTS} shifts × ${MAX_TRAJ} trajectories = $((RATIONAL_SHIFTS * MAX_TRAJ)) walks"
+    echo "  ${N_SHIFTS} shift vecs × ${N_TRAJ} traj vecs = $((N_SHIFTS * N_TRAJ)) walks"
     echo "  Output: ${OUT}/"
     echo "============================================================"
 
@@ -80,8 +80,8 @@ for CMF_NAME in ${CMFS}; do
         --cmf-name "${CMF_NAME}" \
         --depth ${DEPTH} \
         --K ${K} \
-        --rational-shifts ${RATIONAL_SHIFTS} \
-        --max-traj ${MAX_TRAJ} \
+        --n-shifts ${N_SHIFTS} \
+        --n-traj ${N_TRAJ} \
         --output "${OUT}/" \
         --resume
 

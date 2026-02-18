@@ -193,16 +193,19 @@ def _matmul_rxr_mod(A: np.ndarray, B: np.ndarray, pp: np.ndarray, r: int) -> np.
 def _eval_bytecode_allprimes_multiaxis(
     program: CmfProgram,
     step: int,
-    shift_nums: List[int],
-    shift_dens: List[int],
-    inv_dens: List[np.ndarray],
+    sn: List[int],
+    sd: List[int],
+    tn: List[int],
+    td: List[int],
+    inv_cd: List[np.ndarray],
     primes: np.ndarray,
     const_table: np.ndarray,
 ) -> np.ndarray:
-    """Evaluate bytecode producing (m, m, K) matrix with per-axis shift values.
+    """Evaluate bytecode producing (m, m, K) matrix with rational shifts+trajectories.
 
-    Supports rational shifts: k = (shift_num + step * dir * shift_den) / shift_den
-    In modular arithmetic: k = (shift_num + step * dir * shift_den) * inv(shift_den) mod p
+    Per axis i at step s:  val = sn[i]/sd[i] + s * tn[i]/td[i]
+                              = (sn[i]*td[i] + s*tn[i]*sd[i]) / (sd[i]*td[i])
+    inv_cd[i] = precomputed inv(sd[i]*td[i]) mod each prime.
     """
     m = program.m
     K = len(primes)
@@ -217,8 +220,8 @@ def _eval_bytecode_allprimes_multiaxis(
             break
         elif op == Opcode.LOAD_X:
             axis, dest = instr.arg0, instr.arg1
-            k_num = shift_nums[axis] + step * program.directions[axis] * shift_dens[axis]
-            regs[dest] = (np.int64(k_num) % pp * inv_dens[axis]) % pp
+            k_num = sn[axis] * td[axis] + step * tn[axis] * sd[axis]
+            regs[dest] = (np.int64(k_num) % pp * inv_cd[axis]) % pp
         elif op == Opcode.LOAD_C:
             idx, dest = instr.arg0, instr.arg1
             regs[dest] = const_table[idx].copy()
@@ -258,10 +261,12 @@ def _eval_bytecode_allprimes_multiaxis(
 def _eval_bytecode_float_multiaxis(
     program: CmfProgram,
     step: int,
-    shift_nums: List[int],
-    shift_dens: List[int],
+    sn: List[int],
+    sd: List[int],
+    tn: List[int],
+    td: List[int],
 ) -> np.ndarray:
-    """Evaluate bytecode producing (m, m) float64 matrix with per-axis shifts."""
+    """Evaluate bytecode producing (m, m) float64 matrix with rational shifts+trajectories."""
     m = program.m
     regs = [0.0] * 512
     M = np.zeros((m, m), dtype=np.float64)
@@ -272,8 +277,8 @@ def _eval_bytecode_float_multiaxis(
             break
         elif op == Opcode.LOAD_X:
             axis, dest = instr.arg0, instr.arg1
-            k_num = shift_nums[axis] + step * program.directions[axis] * shift_dens[axis]
-            regs[dest] = float(k_num) / float(shift_dens[axis])
+            k_num = sn[axis] * td[axis] + step * tn[axis] * sd[axis]
+            regs[dest] = float(k_num) / float(sd[axis] * td[axis])
         elif op == Opcode.LOAD_C:
             idx, dest = instr.arg0, instr.arg1
             regs[dest] = float(program.constants[idx])
@@ -322,6 +327,37 @@ def _precompute_const_residues(program: CmfProgram, primes: np.ndarray) -> np.nd
     return table
 
 
+# ── Parse rational values ────────────────────────────────────────────────
+
+def _parse_rational_list(vals) -> Tuple[List[int], List[int]]:
+    """Convert a list of int/Fraction/tuple to (numerators, denominators)."""
+    nums, dens = [], []
+    for v in vals:
+        if isinstance(v, Fraction):
+            nums.append(v.numerator)
+            dens.append(v.denominator)
+        elif isinstance(v, tuple):
+            nums.append(v[0])
+            dens.append(v[1])
+        else:
+            nums.append(int(v))
+            dens.append(1)
+    return nums, dens
+
+
+def _precompute_inv_combined(sd: List[int], td: List[int], pp: np.ndarray) -> List[np.ndarray]:
+    """Precompute inv(sd[i] * td[i]) mod each prime."""
+    inv_cd = []
+    for s, t in zip(sd, td):
+        cd = s * t
+        if cd == 1:
+            inv_cd.append(np.ones(len(pp), dtype=np.int64))
+        else:
+            inv_cd.append(np.array(
+                [pow(cd, int(p) - 2, int(p)) for p in pp], dtype=np.int64))
+    return inv_cd
+
+
 # ── Main CMF walk function ───────────────────────────────────────────────
 
 def run_cmf_walk(
@@ -329,17 +365,17 @@ def run_cmf_walk(
     depth: int,
     K: int,
     shift_vals,
+    trajectory_vals=None,
 ) -> Dict[str, Any]:
-    """Walk an r×r companion matrix with per-axis shift values.
+    """Walk an r×r companion matrix with per-axis shift and trajectory values.
 
     Args:
-        program:    compiled CmfProgram (r×r, multi-axis)
-        depth:      walk steps
-        K:          number of RNS primes
-        shift_vals: per-axis starting offsets. Each element can be:
-                    - int: integer shift (backward compatible)
-                    - Fraction: rational shift (uses modular inverse)
-                    - tuple (num, den): rational shift as pair
+        program:         compiled CmfProgram (r×r, multi-axis)
+        depth:           walk steps
+        K:               number of RNS primes
+        shift_vals:      per-axis starting offsets (int, Fraction, or (num,den))
+        trajectory_vals: per-axis step sizes (int, Fraction, or (num,den)).
+                         If None, uses program.directions.
 
     Returns:
         dict with p_residues, q_residues, p_float, q_float, log_scale, primes
@@ -348,28 +384,13 @@ def run_cmf_walk(
     pp = generate_rns_primes(K).astype(np.int64)
     const_table = _precompute_const_residues(program, pp)
 
-    # Convert shift_vals to (numerator, denominator) pairs
-    shift_nums = []
-    shift_dens = []
-    for s in shift_vals:
-        if isinstance(s, Fraction):
-            shift_nums.append(s.numerator)
-            shift_dens.append(s.denominator)
-        elif isinstance(s, tuple):
-            shift_nums.append(s[0])
-            shift_dens.append(s[1])
-        else:
-            shift_nums.append(int(s))
-            shift_dens.append(1)
-
-    # Precompute modular inverses of denominators for each prime
-    inv_dens = []
-    for den in shift_dens:
-        if den == 1:
-            inv_dens.append(np.ones(len(pp), dtype=np.int64))
-        else:
-            inv_dens.append(np.array(
-                [pow(den, int(p) - 2, int(p)) for p in pp], dtype=np.int64))
+    sn, sd = _parse_rational_list(shift_vals)
+    if trajectory_vals is not None:
+        tn, td = _parse_rational_list(trajectory_vals)
+    else:
+        tn = list(program.directions)
+        td = [1] * len(tn)
+    inv_cd = _precompute_inv_combined(sd, td, pp)
 
     # RNS accumulator: P[i,j,k] = entry (i,j) mod prime k, init to identity
     P_rns = np.zeros((r, r, K), dtype=np.int64)
@@ -382,9 +403,9 @@ def run_cmf_walk(
 
     for step in range(depth):
         M_rns = _eval_bytecode_allprimes_multiaxis(
-            program, step, shift_nums, shift_dens, inv_dens, pp, const_table)
+            program, step, sn, sd, tn, td, inv_cd, pp, const_table)
         M_f = _eval_bytecode_float_multiaxis(
-            program, step, shift_nums, shift_dens)
+            program, step, sn, sd, tn, td)
 
         P_rns = _matmul_rxr_mod(P_rns, M_rns, pp, r)
 
@@ -429,26 +450,25 @@ def run_cmf_walk_vec(
     initial_state: List[Fraction],
     acc_idx: int,
     const_idx: int,
+    trajectory_vals=None,
 ) -> Dict[str, Any]:
     """State-vector walk: v(N) = M(N-1) · ... · M(0) · v(0).
 
     Uses matvec (not matmul) — more efficient for state-vector CMFs like
     odd-zeta where the initial state has specific structure.
 
-    Supports rational shifts via modular inverse.  Initial state entries
-    can be Fractions; they are converted to RNS residues.
-
-    The float shadow gives ~15 digit matching precision, sufficient for
-    sweep filtering.  CRT is available when K is large enough.
+    Supports rational shifts AND rational trajectories via modular inverse.
 
     Args:
-        program:       compiled CmfProgram
-        depth:         walk steps
-        K:             number of RNS primes
-        shift_vals:    per-axis shifts (int, Fraction, or (num,den) tuple)
-        initial_state: list of Fraction values for v(0)
-        acc_idx:       index of accumulator entry (p)
-        const_idx:     index of constant entry (q)
+        program:         compiled CmfProgram
+        depth:           walk steps
+        K:               number of RNS primes
+        shift_vals:      per-axis shifts (int, Fraction, or (num,den))
+        initial_state:   list of Fraction values for v(0)
+        acc_idx:         index of accumulator entry (p)
+        const_idx:       index of constant entry (q)
+        trajectory_vals: per-axis trajectories (int, Fraction, or (num,den)).
+                         If None, uses program.directions.
 
     Returns:
         dict with p_residues, q_residues, p_float, q_float, log_scale, primes
@@ -457,31 +477,15 @@ def run_cmf_walk_vec(
     pp = generate_rns_primes(K).astype(np.int64)
     const_table = _precompute_const_residues(program, pp)
 
-    # Convert shift_vals to (numerator, denominator) pairs
-    shift_nums = []
-    shift_dens = []
-    for s in shift_vals:
-        if isinstance(s, Fraction):
-            shift_nums.append(s.numerator)
-            shift_dens.append(s.denominator)
-        elif isinstance(s, tuple):
-            shift_nums.append(s[0])
-            shift_dens.append(s[1])
-        else:
-            shift_nums.append(int(s))
-            shift_dens.append(1)
-
-    # Precompute modular inverses of shift denominators
-    inv_dens = []
-    for den in shift_dens:
-        if den == 1:
-            inv_dens.append(np.ones(len(pp), dtype=np.int64))
-        else:
-            inv_dens.append(np.array(
-                [pow(den, int(p) - 2, int(p)) for p in pp], dtype=np.int64))
+    sn, sd = _parse_rational_list(shift_vals)
+    if trajectory_vals is not None:
+        tn, td = _parse_rational_list(trajectory_vals)
+    else:
+        tn = list(program.directions)
+        td = [1] * len(tn)
+    inv_cd = _precompute_inv_combined(sd, td, pp)
 
     # Convert initial state (Fractions) to RNS residues
-    # v_rns[i, ki] = initial_state[i].numerator * inv(initial_state[i].denominator) mod prime[ki]
     v_rns = np.zeros((r, K), dtype=np.int64)
     for i in range(r):
         f = initial_state[i]
@@ -504,9 +508,9 @@ def run_cmf_walk_vec(
 
     for step in range(depth):
         M_rns = _eval_bytecode_allprimes_multiaxis(
-            program, step, shift_nums, shift_dens, inv_dens, pp, const_table)
+            program, step, sn, sd, tn, td, inv_cd, pp, const_table)
         M_f = _eval_bytecode_float_multiaxis(
-            program, step, shift_nums, shift_dens)
+            program, step, sn, sd, tn, td)
 
         # v = M @ v (matvec, not matmul)
         v_rns = _matvec_mod(M_rns, v_rns, pp, r)

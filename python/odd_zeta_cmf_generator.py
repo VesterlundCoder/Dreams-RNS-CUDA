@@ -26,8 +26,8 @@ import sympy as sp
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
-def build_cmf_matrix_2n(n: int):
-    """Build the 2n×2n CMF matrix for ζ(2n+1) as a sympy Matrix in k.
+def build_cmf_matrix_2n(n: int, multiaxis: bool = True):
+    """Build the 2n×2n CMF matrix for ζ(2n+1) as a sympy Matrix.
 
     From the HPHP08 construction:
       - r_k = -(k+1) / (2*(2k+1))
@@ -37,9 +37,22 @@ def build_cmf_matrix_2n(n: int):
       - S(k+1) = S(k) + (1/2)/(k+1)³ * Σ_j c_{n,j}(k+1) * Uj(k+1)
       - Zero rows for padding
 
-    Returns: (matrix_dict, dim, axis_names, target_zeta)
+    If multiaxis=True, decomposes into per-row independent axes.
+    Each U-row j gets its own numerator and denominator axes, plus a
+    coupling axis if j >= 1.  The accumulator gets its own axis.
+
+    Axis layout per U-row j:
+      x_{3j}   = (k+1) numerator of r_k in row j   (direction=1, shift=2)
+      x_{3j+1} = (2k+1) denominator of r_k in row j (direction=2, shift=3)
+      x_{3j+2} = k coupling in row j (j>=1 only)    (direction=1, shift=1)
+    Final axis:
+      x_{3n-n+1..} = (k+1) in accumulator/kernel     (direction=1, shift=2)
+
+    Total dimensions = 2*n (num+den per row) + (n-1) (coupling) + 1 (acc) = 3n
+    Standard directions reproduce original k=1,2,3,...
+
+    Returns: (matrix_dict, dim, axis_names, directions, default_shifts, target_zeta)
     """
-    k = sp.Symbol('k')
     d = 2 * n
 
     # Index layout: [U0 U1 ... U_{n-1} S 1 Z0 Z1 ... Z_{n-3}]
@@ -47,56 +60,112 @@ def build_cmf_matrix_2n(n: int):
     idxS = n
     idx1 = n + 1
 
-    # Basic ratio
-    rk = -(k + 1) / (2 * (2*k + 1))
+    if multiaxis:
+        # Build per-row axis symbols
+        # Layout: [num_0, den_0, num_1, den_1, sq_1, num_2, den_2, sq_2, ..., acc]
+        axis_names = []
+        directions = []
+        default_shifts = []
+
+        # Per-row symbols and their axis indices
+        row_num_sym = []   # x for (k+1) numerator per row
+        row_den_sym = []   # x for (2k+1) denominator per row
+        row_sq_sym = []    # x for k coupling per row (None for j=0)
+        axis_idx = 0
+
+        for j in range(n):
+            # Numerator axis: replaces (k+1) in r_k for row j
+            name_n = f'x{axis_idx}'
+            sym_n = sp.Symbol(name_n)
+            row_num_sym.append(sym_n)
+            axis_names.append(name_n)
+            directions.append(1)       # (k+1) advances by 1
+            default_shifts.append(2)   # k+1 = 2 at k=1
+            axis_idx += 1
+
+            # Denominator axis: replaces (2k+1) in r_k for row j
+            name_d = f'x{axis_idx}'
+            sym_d = sp.Symbol(name_d)
+            row_den_sym.append(sym_d)
+            axis_names.append(name_d)
+            directions.append(2)       # (2k+1) advances by 2
+            default_shifts.append(3)   # 2k+1 = 3 at k=1
+            axis_idx += 1
+
+            # Coupling axis: replaces k in k² for rows j >= 1
+            if j >= 1:
+                name_s = f'x{axis_idx}'
+                sym_s = sp.Symbol(name_s)
+                row_sq_sym.append(sym_s)
+                axis_names.append(name_s)
+                directions.append(1)       # k advances by 1
+                default_shifts.append(1)   # k = 1 at k=1
+                axis_idx += 1
+            else:
+                row_sq_sym.append(None)
+
+        # Accumulator axis: replaces (k+1) in factor and kernel coefficients
+        acc_name = f'x{axis_idx}'
+        kp1_acc = sp.Symbol(acc_name)
+        axis_names.append(acc_name)
+        directions.append(1)       # (k+1) advances by 1
+        default_shifts.append(2)   # k+1 = 2 at k=1
+        axis_idx += 1
+
+        dim = axis_idx
+
+        # Build per-row r_k ratios
+        rk_per_row = []
+        for j in range(n):
+            rk_per_row.append(-row_num_sym[j] / (2 * row_den_sym[j]))
+
+    else:
+        k = sp.Symbol('k')
+        kp1_acc = k + 1
+
+        axis_names = ['k']
+        directions = [1]
+        default_shifts = [1]
+        dim = 1
+
+        rk_per_row = [-(k + 1) / (2 * (2*k + 1))] * n
+        row_sq_sym = [k] * n
 
     # Build matrix entries
     M = sp.zeros(d, d)
 
     # U0 row: U0_{k+1} = r_k * U0_k
-    M[idxU[0], idxU[0]] = rk
+    M[idxU[0], idxU[0]] = rk_per_row[0]
 
     # Uj rows (j >= 1): Uj_{k+1} = r_k * Uj_k + (r_k / k²) * U_{j-1}_k
     for j in range(1, n):
-        M[idxU[j], idxU[j]] = rk
-        M[idxU[j], idxU[j-1]] = rk / (k**2)
+        M[idxU[j], idxU[j]] = rk_per_row[j]
+        sq = row_sq_sym[j] if multiaxis else row_sq_sym[j]
+        M[idxU[j], idxU[j-1]] = rk_per_row[j] / (sq**2)
 
     # Constant row: 1(k+1) = 1(k)
     M[idx1, idx1] = 1
 
-    # Zero-padding rows: already zero
-
-    # Accumulator row: S(k+1) = S(k) + factor * Σ_j c_{n,j}(k+1) * [row for Uj]
-    # where factor = (1/2) / (k+1)³
-    # and c_{n,j}(k+1) are the kernel coefficients at k+1
-
-    kp1 = k + 1
-
-    # Kernel coefficients c_{n,j} at k+1
+    # Kernel coefficients c_{n,j} at k+1 (using accumulator axis)
     c_syms = [sp.Rational(0)] * n
     c_syms[n-1] = sp.Rational(5) * (sp.Rational(-1)**(n-1))
     for j in range(0, n-1):
         t = (n-1) - j
-        c_syms[j] += sp.Rational(4) * (sp.Rational(-1)**j) / (kp1**(2*t))
+        c_syms[j] += sp.Rational(4) * (sp.Rational(-1)**j) / (kp1_acc**(2*t))
 
-    # Build accumulator row by composing with U rows
+    # Accumulator factor (using accumulator axis)
+    factor = sp.Rational(1, 2) / (kp1_acc**3)
+
     # S(k+1) = S(k) + factor * Σ_j c_{n,j} * [Uj row applied to state]
-    # The Uj row gives: Uj(k+1) = M[j, :] · state
-    # So S(k+1) = S(k) + factor * Σ_j c_{n,j} * (Σ_col M[j, col] * state[col])
-
-    factor = sp.Rational(1, 2) / (kp1**3)
-
-    # Start with S(k+1) = S(k)
     M[idxS, idxS] = 1
 
-    # Add the contribution from each Uj
     for j in range(n):
         coeff = factor * c_syms[j]
         for col in range(d):
             if M[idxU[j], col] != 0:
                 M[idxS, col] += coeff * M[idxU[j], col]
 
-    # Convert to dictionary format for our compiler
+    # Convert to dictionary format for compiler
     matrix_dict = {}
     for i in range(d):
         for j in range(d):
@@ -104,7 +173,7 @@ def build_cmf_matrix_2n(n: int):
             if entry != 0:
                 matrix_dict[(i, j)] = str(entry)
 
-    return matrix_dict, d, ['k'], 2*n + 1
+    return matrix_dict, dim, axis_names, directions, default_shifts, 2*n + 1
 
 
 def generate_shifts(n_shifts: int = 512):
@@ -150,7 +219,7 @@ def main():
         print(f"  ζ({zeta_val}): n={n}, {d}×{d} matrix ... ", end="", flush=True)
 
         try:
-            matrix_dict, dim_mat, axis_names, target = build_cmf_matrix_2n(n)
+            matrix_dict, dim_val, axis_names, dirs, def_shifts, target = build_cmf_matrix_2n(n)
             n_nonzero = len(matrix_dict)
 
             spec = {
@@ -159,16 +228,17 @@ def main():
                 "n": n,
                 "zeta_val": zeta_val,
                 "rank": d,
-                "dim": 1,
+                "dim": dim_val,
                 "matrix": {f"{r},{c}": expr for (r, c), expr in matrix_dict.items()},
                 "axis_names": axis_names,
-                "directions": [1],
+                "directions": dirs,
+                "default_shifts": def_shifts,
                 "accumulator_idx": n,
                 "constant_idx": n + 1,
             }
             specs.append(spec)
 
-            print(f"{n_nonzero} nonzero entries ✓")
+            print(f"{n_nonzero} nonzero entries, {dim_val} axes ✓")
 
         except Exception as e:
             print(f"ERROR: {e}")
@@ -188,20 +258,14 @@ def main():
     print(f"Wrote {len(shifts)} shifts to {args.shifts_output}")
 
     # Summary table
-    print(f"\n{'n':>4} {'ζ':>8} {'dim':>6} {'nonzero':>8}")
-    print("-" * 30)
+    print(f"\n{'n':>4} {'ζ':>8} {'matrix':>8} {'axes':>6} {'nonzero':>8}")
+    print("-" * 40)
     for spec in specs:
         n = spec['n']
         d = spec['rank']
         nz = len(spec['matrix'])
-        print(f"{n:>4} ζ({spec['zeta_val']}) {d:>3}×{d:<3} {nz:>6}")
-
-    # Practical guidance
-    print(f"\nPractical limits for GPU sweep:")
-    print(f"  4×4  (ζ(5)):   fast, ~1000 shifts trivial")
-    print(f"  10×10 (ζ(11)): moderate, 512 shifts OK")
-    print(f"  20×20 (ζ(21)): ~25x slower per step than 4×4")
-    print(f"  40×40 (ζ(41)): heavy, reduce shifts or depth")
+        dim = spec['dim']
+        print(f"{n:>4} ζ({spec['zeta_val']}) {d:>3}×{d:<3}  {dim:>4}    {nz:>6}")
 
 
 if __name__ == "__main__":

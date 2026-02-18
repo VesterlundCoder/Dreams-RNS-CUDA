@@ -2,28 +2,30 @@
 """
 Odd-Zeta CMF Sweep: compiled RNS walk for ζ(2n+1) CMFs.
 
-Uses the Dreams RNS compiled bytecode pipeline — NO sympy in the hot loop.
-Supports rational shifts (±1/d) via modular inverse in the bytecode evaluator.
-Float shadow (~15 digit precision) is the primary matching metric for sweep.
+Multi-dimensional exploration: each CMF has dim = 3n axes (per-row decomposition).
+Supports rational shifts AND rational trajectories via modular inverse.
+Float shadow (~15 digit precision) is the primary matching metric.
 
-Shifts and trajectories explored are tracked in the output JSONL so runs
-can be resumed and extended without repeating work.
+The 1000 trajectory vectors explore different "angles" in the multi-dim parameter
+space by perturbing the standard direction vector one or two axes at a time.
+Shifts perturb the standard starting offsets similarly.
+
+All completed (shift, trajectory) combos are tracked for resume.
 
 Pipeline:
-  1. THIS SCRIPT → fast compiled-bytecode sweep, many shifts × trajectories
+  1. THIS SCRIPT → fast compiled-bytecode sweep
   2. odd_zeta_exact.py (CPU) → deep exact big-integer analysis of hits
-  3. Manual algebraic proof of irrationality
 
 Usage:
     python odd_zeta_cmf_generator.py --n-min 2 --n-max 10 --output odd_zeta_specs.jsonl
 
-    # Exhaustive: 50 rational shifts × 1000 trajectories
+    # Full: 50 shift vectors × 1000 trajectory vectors in multi-dim space
     python odd_zeta_sweep.py --specs odd_zeta_specs.jsonl --cmf-name zeta_5 \
-        --rational-shifts 50 --max-traj 1000 --depth 1000 --K 16
+        --n-shifts 50 --n-traj 1000 --depth 1000 --K 16
 
     # Quick test
-    python odd_zeta_sweep.py --specs odd_zeta_specs.jsonl --depth 500 \
-        --shifts 10 --max-traj 5 --max-cmfs 1
+    python odd_zeta_sweep.py --specs odd_zeta_specs.jsonl --depth 200 \
+        --n-shifts 3 --n-traj 5 --max-cmfs 1
 """
 
 import argparse
@@ -50,8 +52,12 @@ import mpmath as mp
 
 # ── Compile odd-zeta CMF to bytecode ────────────────────────────────────
 
-def compile_odd_zeta_cmf(spec: Dict, trajectory: int = 1):
-    """Compile an odd-zeta CMF spec into a CmfProgram with given trajectory."""
+def compile_odd_zeta_cmf(spec: Dict):
+    """Compile an odd-zeta CMF spec into a CmfProgram (once per CMF).
+
+    Directions are stored in the program but can be overridden at walk time
+    via trajectory_vals parameter.
+    """
     matrix_dict = {}
     for key, expr_str in spec['matrix'].items():
         r, c = key.split(',')
@@ -62,7 +68,7 @@ def compile_odd_zeta_cmf(spec: Dict, trajectory: int = 1):
         m=spec['rank'],
         dim=spec['dim'],
         axis_names=spec.get('axis_names', ['k']),
-        directions=[trajectory],
+        directions=spec.get('directions', [1]),
     )
     return program
 
@@ -108,32 +114,181 @@ def compute_initial_state(n: int) -> List[Fraction]:
     return v
 
 
-# ── Shift generation ───────────────────────────────────────────────────
+# ── Multi-dim trajectory generation ────────────────────────────────────
 
-def generate_rational_shifts(n: int) -> List[Fraction]:
-    """Generate n rational shifts: ±1/d for d=1,2,3,...
+# Perturbation multipliers for trajectory exploration
+TRAJ_MULTIPLIERS = [
+    Fraction(1, 3), Fraction(1, 2), Fraction(2, 3),
+    Fraction(3, 2), Fraction(2), Fraction(3),
+    Fraction(-1), Fraction(-1, 2), Fraction(-1, 3),
+    Fraction(0),
+]
 
-    Pattern: 1, -1, 1/2, -1/2, 1/3, -1/3, ...
+
+def generate_trajectory_vectors(
+    dim: int,
+    default_dirs: List[int],
+    n_traj: int,
+) -> List[List[Fraction]]:
+    """Generate n_traj trajectory vectors in dim-dimensional space.
+
+    Strategy:
+      1. Standard trajectory (default_dirs)
+      2. Single-axis perturbations: scale one axis by rational multipliers
+      3. Two-axis perturbations: scale pairs of axes
+      4. Fill remaining with more combinations
+
+    Returns list of Fraction vectors, each of length dim.
     """
-    shifts = []
-    d = 1
-    while len(shifts) < n:
-        shifts.append(Fraction(1, d))
-        if len(shifts) < n:
-            shifts.append(Fraction(-1, d))
-        d += 1
-    return shifts[:n]
+    base = [Fraction(d) for d in default_dirs]
+    trajs = [list(base)]  # index 0 = standard
+    seen = {_vec_key(base)}
+
+    # Phase 1: single-axis perturbations
+    for axis in range(dim):
+        for mult in TRAJ_MULTIPLIERS:
+            if len(trajs) >= n_traj:
+                break
+            vec = list(base)
+            vec[axis] = base[axis] * mult
+            key = _vec_key(vec)
+            if key not in seen:
+                trajs.append(vec)
+                seen.add(key)
+
+    # Phase 2: two-axis perturbations
+    for a1 in range(dim):
+        for a2 in range(a1 + 1, dim):
+            for m1 in TRAJ_MULTIPLIERS[:5]:
+                for m2 in TRAJ_MULTIPLIERS[:5]:
+                    if len(trajs) >= n_traj:
+                        break
+                    vec = list(base)
+                    vec[a1] = base[a1] * m1
+                    vec[a2] = base[a2] * m2
+                    key = _vec_key(vec)
+                    if key not in seen:
+                        trajs.append(vec)
+                        seen.add(key)
+                if len(trajs) >= n_traj:
+                    break
+            if len(trajs) >= n_traj:
+                break
+        if len(trajs) >= n_traj:
+            break
+
+    # Phase 3: three-axis perturbations if still room
+    if len(trajs) < n_traj:
+        for a1 in range(min(dim, 6)):
+            for a2 in range(a1 + 1, min(dim, 8)):
+                for a3 in range(a2 + 1, min(dim, 10)):
+                    for m1 in TRAJ_MULTIPLIERS[:3]:
+                        for m2 in TRAJ_MULTIPLIERS[:3]:
+                            for m3 in TRAJ_MULTIPLIERS[:3]:
+                                if len(trajs) >= n_traj:
+                                    break
+                                vec = list(base)
+                                vec[a1] = base[a1] * m1
+                                vec[a2] = base[a2] * m2
+                                vec[a3] = base[a3] * m3
+                                key = _vec_key(vec)
+                                if key not in seen:
+                                    trajs.append(vec)
+                                    seen.add(key)
+                            if len(trajs) >= n_traj:
+                                break
+                        if len(trajs) >= n_traj:
+                            break
+                    if len(trajs) >= n_traj:
+                        break
+                if len(trajs) >= n_traj:
+                    break
+            if len(trajs) >= n_traj:
+                break
+
+    return trajs[:n_traj]
 
 
-def generate_integer_shifts(n: int) -> List[Fraction]:
-    """Generate n integer shifts: 1, 2, 3, ..., n as Fractions."""
-    return [Fraction(i) for i in range(1, n + 1)]
+# ── Multi-dim shift generation ─────────────────────────────────────────
+
+SHIFT_OFFSETS = [
+    Fraction(0),
+    Fraction(1), Fraction(-1),
+    Fraction(1, 2), Fraction(-1, 2),
+    Fraction(1, 3), Fraction(-1, 3),
+    Fraction(2), Fraction(-2),
+    Fraction(1, 4), Fraction(-1, 4),
+]
 
 
-# ── Resume: load already-computed (shift, traj) combos ─────────────────
+def generate_shift_vectors(
+    dim: int,
+    default_shifts: List[int],
+    n_shifts: int,
+) -> List[List[Fraction]]:
+    """Generate n_shifts shift vectors in dim-dimensional space.
+
+    Strategy:
+      1. Standard shift (default_shifts)
+      2. Single-axis offsets: add ±1/d to one axis
+      3. Two-axis offsets
+    """
+    base = [Fraction(s) for s in default_shifts]
+    shifts = [list(base)]
+    seen = {_vec_key(base)}
+
+    # Single-axis offsets
+    for axis in range(dim):
+        for offset in SHIFT_OFFSETS:
+            if offset == 0:
+                continue
+            if len(shifts) >= n_shifts:
+                break
+            vec = list(base)
+            vec[axis] = base[axis] + offset
+            key = _vec_key(vec)
+            if key not in seen:
+                shifts.append(vec)
+                seen.add(key)
+
+    # Two-axis offsets
+    for a1 in range(dim):
+        for a2 in range(a1 + 1, dim):
+            for o1 in SHIFT_OFFSETS[1:4]:
+                for o2 in SHIFT_OFFSETS[1:4]:
+                    if len(shifts) >= n_shifts:
+                        break
+                    vec = list(base)
+                    vec[a1] = base[a1] + o1
+                    vec[a2] = base[a2] + o2
+                    key = _vec_key(vec)
+                    if key not in seen:
+                        shifts.append(vec)
+                        seen.add(key)
+                if len(shifts) >= n_shifts:
+                    break
+            if len(shifts) >= n_shifts:
+                break
+        if len(shifts) >= n_shifts:
+            break
+
+    return shifts[:n_shifts]
+
+
+def _vec_key(vec: List[Fraction]) -> str:
+    """Hashable key for a Fraction vector."""
+    return "|".join(str(v) for v in vec)
+
+
+def _vec_str(vec: List[Fraction]) -> str:
+    """Compact string representation for results."""
+    return "[" + ",".join(str(v) for v in vec) + "]"
+
+
+# ── Resume: load already-computed keys ─────────────────────────────────
 
 def load_completed_keys(results_path: str) -> Set[str]:
-    """Load (cmf, shift_str, traj) keys from existing JSONL results."""
+    """Load (cmf, shift_str, traj_str) keys from existing JSONL results."""
     done = set()
     if os.path.exists(results_path):
         with open(results_path) as f:
@@ -154,20 +309,18 @@ def load_completed_keys(results_path: str) -> Set[str]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Odd-Zeta CMF Sweep — compiled RNS walk"
+        description="Odd-Zeta CMF Sweep — compiled RNS walk, multi-dimensional"
     )
     parser.add_argument("--specs", type=str, required=True,
                         help="CMF specs JSONL from odd_zeta_cmf_generator.py")
     parser.add_argument("--depth", type=int, default=1000,
                         help="Walk depth (default 1000)")
-    parser.add_argument("--shifts", type=int, default=0,
-                        help="Number of integer shifts (1..N). Ignored if --rational-shifts set.")
-    parser.add_argument("--rational-shifts", type=int, default=0,
-                        help="Number of rational shifts (±1/d). Takes priority over --shifts.")
-    parser.add_argument("--max-traj", type=int, default=10,
-                        help="Max trajectory stride (1..max_traj)")
+    parser.add_argument("--n-shifts", type=int, default=50,
+                        help="Number of multi-dim shift vectors to generate")
+    parser.add_argument("--n-traj", type=int, default=1000,
+                        help="Number of multi-dim trajectory vectors to generate")
     parser.add_argument("--K", type=int, default=16,
-                        help="RNS primes (default 16; float shadow is primary for sweep)")
+                        help="RNS primes (default 16; float shadow is primary)")
     parser.add_argument("--dps", type=int, default=50,
                         help="mpmath dps for constant evaluation")
     parser.add_argument("--max-cmfs", type=int, default=0,
@@ -179,23 +332,8 @@ def main():
     parser.add_argument("--output", type=str, default="odd_zeta_results/",
                         help="Output directory")
     parser.add_argument("--resume", action="store_true",
-                        help="Skip already-computed (shift, traj) combos in output")
+                        help="Skip already-computed combos in output")
     args = parser.parse_args()
-
-    # Default: 50 rational shifts if neither is set
-    if args.rational_shifts == 0 and args.shifts == 0:
-        args.rational_shifts = 50
-
-    # Generate shifts
-    if args.rational_shifts > 0:
-        shifts = generate_rational_shifts(args.rational_shifts)
-        shift_mode = "rational"
-    else:
-        shifts = generate_integer_shifts(args.shifts)
-        shift_mode = "integer"
-
-    # Trajectories: 1..max_traj
-    trajectories = list(range(1, args.max_traj + 1))
 
     # Load constants
     constants = load_constants(args.dps)
@@ -220,14 +358,13 @@ def main():
         if args.max_cmfs > 0:
             specs = specs[:args.max_cmfs]
 
-    n_tasks = len(shifts) * len(trajectories)
-    print(f"\nOdd-Zeta CMF Sweep — compiled RNS bytecode walk")
+    print(f"\nOdd-Zeta CMF Sweep — compiled RNS, multi-dimensional")
     print(f"  CMFs:        {len(specs)}")
-    print(f"  Shifts:      {len(shifts)} ({shift_mode})")
-    print(f"  Trajectories:{len(trajectories)} (1..{args.max_traj})")
-    print(f"  Tasks/CMF:   {n_tasks}")
+    print(f"  Shift vecs:  {args.n_shifts}")
+    print(f"  Traj vecs:   {args.n_traj}")
+    print(f"  Tasks/CMF:   {args.n_shifts * args.n_traj}")
     print(f"  Depth:       {args.depth}")
-    print(f"  K:           {args.K} (float shadow is primary)")
+    print(f"  K:           {args.K}")
     print(f"  Constants:   {len(constants)}")
     print(f"  Resume:      {args.resume}")
     print(f"{'='*80}")
@@ -235,12 +372,10 @@ def main():
     os.makedirs(args.output, exist_ok=True)
     results_path = os.path.join(args.output, "odd_zeta_results.jsonl")
 
-    # Resume: load completed keys
     done_keys = load_completed_keys(results_path) if args.resume else set()
     if done_keys:
         print(f"  Resuming: {len(done_keys)} results already computed")
 
-    # Open results in append mode
     results_file = open(results_path, 'a')
     total_new = 0
     total_hits = 0
@@ -251,50 +386,56 @@ def main():
             zeta_val = spec['zeta_val']
             rank = spec['rank']
             n = spec['n']
+            dim = spec['dim']
             acc_idx = spec.get('accumulator_idx', n)
             const_idx = spec.get('constant_idx', n + 1)
+            default_dirs = spec.get('directions', [1])
+            default_shifts = spec.get('default_shifts', [1] * dim)
 
             print(f"\n{'━'*80}")
-            print(f"[{ci+1}/{len(specs)}] {name}: ζ({zeta_val}), {rank}×{rank} matrix")
+            print(f"[{ci+1}/{len(specs)}] {name}: ζ({zeta_val}), "
+                  f"{rank}×{rank} matrix, {dim} axes")
 
-            # Compute initial state (once per CMF)
+            # Compute initial state
             v0 = compute_initial_state(n)
 
-            # Compile bytecode — we recompile per trajectory (directions change)
-            # But cache by trajectory value
-            prog_cache = {}
+            # Compile bytecode ONCE per CMF (trajectory passed at walk time)
+            try:
+                program = compile_odd_zeta_cmf(spec)
+            except Exception as e:
+                print(f"  COMPILE ERROR: {e}")
+                continue
+
+            # Generate multi-dim shift and trajectory vectors
+            shift_vecs = generate_shift_vectors(dim, default_shifts, args.n_shifts)
+            traj_vecs = generate_trajectory_vectors(dim, default_dirs, args.n_traj)
+            print(f"  Generated {len(shift_vecs)} shift vecs × "
+                  f"{len(traj_vecs)} traj vecs = "
+                  f"{len(shift_vecs) * len(traj_vecs)} walks")
+
             t_cmf_start = time.time()
             cmf_new = 0
             cmf_hits = 0
             best_hit = None
+            n_tasks = len(shift_vecs) * len(traj_vecs)
 
-            for ti, traj in enumerate(trajectories):
-                # Compile (or cache) for this trajectory
-                if traj not in prog_cache:
-                    try:
-                        prog_cache[traj] = compile_odd_zeta_cmf(spec, trajectory=traj)
-                    except Exception as e:
-                        if traj == 1:
-                            print(f"  COMPILE ERROR (traj={traj}): {e}")
-                        prog_cache[traj] = None
+            for ti, traj_vec in enumerate(traj_vecs):
+                traj_str = _vec_str(traj_vec)
 
-                program = prog_cache[traj]
-                if program is None:
-                    continue
-
-                for si, shift in enumerate(shifts):
-                    shift_str = str(shift)
-                    key = f"{name}|{shift_str}|{traj}"
+                for si, shift_vec in enumerate(shift_vecs):
+                    shift_str = _vec_str(shift_vec)
+                    key = f"{name}|{shift_str}|{traj_str}"
                     if key in done_keys:
                         continue
 
                     try:
                         res = run_cmf_walk_vec(
                             program, args.depth, args.K,
-                            shift_vals=[shift],
+                            shift_vals=shift_vec,
                             initial_state=v0,
                             acc_idx=acc_idx,
                             const_idx=const_idx,
+                            trajectory_vals=traj_vec,
                         )
 
                         pf = res['p_float']
@@ -304,7 +445,7 @@ def main():
                         if not math.isfinite(est):
                             continue
 
-                        # Match against all constants (float-level)
+                        # Match against all constants
                         best_const = "none"
                         best_digits = -1.0
 
@@ -317,24 +458,20 @@ def main():
                                     err / max(abs(c['value_float']), 1e-300))
                             else:
                                 digits = 0.0
-
                             if digits > best_digits:
                                 best_digits = digits
                                 best_const = c['name']
                         best_digits = max(best_digits, 0.0)
 
-                        # Float delta (secondary; needs growing q to be meaningful)
+                        # Float delta (secondary)
                         log_q = res['log_scale'] + (
                             math.log(abs(qf)) if abs(qf) > 1e-300 else 0)
-                        if best_const and log_q > 1:
+                        if best_const != "none" and log_q > 1:
                             target_f = next(
                                 c['value_float'] for c in constants
                                 if c['name'] == best_const)
                             err = abs(est - target_f)
-                            if err > 0:
-                                best_delta = -(1.0 + math.log(err) / log_q)
-                            else:
-                                best_delta = float('inf')
+                            best_delta = -(1.0 + math.log(err) / log_q) if err > 0 else float('inf')
                         else:
                             best_delta = float('nan')
 
@@ -342,8 +479,9 @@ def main():
                             'cmf': name,
                             'zeta_val': zeta_val,
                             'rank': rank,
+                            'dim': dim,
                             'shift': shift_str,
-                            'trajectory': traj,
+                            'trajectory': traj_str,
                             'depth': args.depth,
                             'est': round(est, 15),
                             'best_const': best_const,
@@ -365,26 +503,27 @@ def main():
                             best_hit = result
 
                     except Exception as e:
-                        if traj == 1 and si == 0:
-                            print(f"  WALK ERROR (shift={shift}, traj={traj}): {e}")
+                        if ti == 0 and si == 0:
+                            print(f"  WALK ERROR: {e}")
                             import traceback; traceback.print_exc()
                         continue
 
-                # Progress every 50 trajectories
-                if (ti + 1) % 50 == 0 or ti == len(trajectories) - 1:
+                # Progress
+                if (ti + 1) % 50 == 0 or ti == len(traj_vecs) - 1:
                     elapsed = time.time() - t_cmf_start
                     rate = cmf_new / max(elapsed, 0.001)
-                    print(f"  traj {ti+1}/{len(trajectories)}: "
-                          f"{cmf_new} walks, {cmf_hits} hits (≥6 digits), "
-                          f"{rate:.0f} walks/s", flush=True)
+                    done_pct = (ti + 1) * len(shift_vecs) / n_tasks * 100
+                    print(f"  traj {ti+1}/{len(traj_vecs)} ({done_pct:.0f}%): "
+                          f"{cmf_new} walks, {cmf_hits} hits (≥6d), "
+                          f"{rate:.1f} walks/s", flush=True)
 
             results_file.flush()
             elapsed = time.time() - t_cmf_start
 
             if best_hit:
-                print(f"  Best: {best_hit['match_digits']} digits → {best_hit['best_const']} "
-                      f"(shift={best_hit['shift']}, traj={best_hit['trajectory']}, "
-                      f"est={best_hit['est']})")
+                print(f"  Best: {best_hit['match_digits']} digits → "
+                      f"{best_hit['best_const']} "
+                      f"(est={best_hit['est']})")
             print(f"  Total: {cmf_new} new walks in {elapsed:.1f}s")
 
     finally:
@@ -396,9 +535,6 @@ def main():
     print(f"  Hits (≥6d): {total_hits}")
     print(f"  Results:    {results_path}")
     print(f"  Total keys: {len(done_keys)}")
-    print(f"\n  Deep analysis of hits:")
-    print(f"    python odd_zeta_exact.py --specs {args.specs} --depth 5000 "
-          f"--shifts <S> --trajectories <T> --cmf-name <NAME>")
 
 
 if __name__ == "__main__":
