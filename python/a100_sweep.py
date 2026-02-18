@@ -115,8 +115,26 @@ def run_euler2ai_mode(args, constants):
 
             # Float estimate
             est = res['p_float'] / res['q_float'] if abs(res['q_float']) > 1e-300 else float('nan')
+            log_scale = res.get('log_scale', 0.0)
+            q_float = res['q_float']
 
             elapsed = time.time() - t0
+
+            # Detect CRT overflow: compare CRT ratio with float shadow
+            crt_valid = True
+            if q_big == 0 or not math.isfinite(est):
+                crt_valid = False
+            else:
+                try:
+                    crt_ratio = float(p_big) / float(q_big)
+                    if not math.isfinite(crt_ratio):
+                        crt_valid = False
+                    elif abs(est) > 1e-10:
+                        crt_valid = abs(crt_ratio - est) / abs(est) < 0.01
+                    else:
+                        crt_valid = abs(crt_ratio - est) < 0.01
+                except Exception:
+                    crt_valid = False
 
             # 1. Delta against stated limit (each Euler2AI PCF has its own target)
             delta_stated = float('-inf')
@@ -130,8 +148,17 @@ def run_euler2ai_mode(args, constants):
                         "pi": sp.pi, "E": sp.E, "EulerGamma": sp.EulerGamma})
                     target_mp = mp.mpf(str(sp.N(target_expr, args.dps)))
                     limit_float = float(target_mp)
-                    delta_stated = float(compute_delta_against_constant(
-                        p_big, q_big, target_mp, args.dps))
+                    if crt_valid:
+                        delta_stated = float(compute_delta_against_constant(
+                            p_big, q_big, target_mp, args.dps))
+                    else:
+                        # CRT overflow — use float shadow delta
+                        err = abs(est - limit_float)
+                        if err > 0:
+                            log_err = math.log(err)
+                            log_q = log_scale + (math.log(abs(q_float)) if abs(q_float) > 1e-300 else 0)
+                            if log_q > 0:
+                                delta_stated = -(1.0 + log_err / log_q)
                 except Exception:
                     pass
 
@@ -140,7 +167,20 @@ def run_euler2ai_mode(args, constants):
             best_delta = float('-inf')
             best_const = None
             for c in constants:
-                delta = compute_delta_against_constant(p_big, q_big, c['value'], args.dps)
+                if crt_valid:
+                    delta = compute_delta_against_constant(p_big, q_big, c['value'], args.dps)
+                else:
+                    # Float delta for bank constants too
+                    try:
+                        err = abs(est - c['value_float'])
+                        if err > 0:
+                            log_err = math.log(err)
+                            log_q = log_scale + (math.log(abs(q_float)) if abs(q_float) > 1e-300 else 0)
+                            delta = -(1.0 + log_err / log_q) if log_q > 0 else float('-inf')
+                        else:
+                            delta = float('inf')
+                    except Exception:
+                        delta = float('-inf')
                 if delta > best_delta:
                     best_delta = delta
                     best_const = c['name']
@@ -332,34 +372,56 @@ def run_cmf_sweep_mode(args, constants):
 
                     est = (res['p_float'] / res['q_float']
                            if abs(res['q_float']) > 1e-300 else float('nan'))
+                    log_scale = res.get('log_scale', 0.0)
+                    q_float = res['q_float']
 
                     if not math.isfinite(est):
                         continue
+
+                    # Detect CRT overflow
+                    crt_ok = True
+                    if q_big == 0:
+                        crt_ok = False
+                    else:
+                        try:
+                            cr = float(p_big) / float(q_big)
+                            if not math.isfinite(cr):
+                                crt_ok = False
+                            elif abs(est) > 1e-10:
+                                crt_ok = abs(cr - est) / abs(est) < 0.01
+                            else:
+                                crt_ok = abs(cr - est) < 0.01
+                        except Exception:
+                            crt_ok = False
 
                     # Quick proximity check (cheap, float-only)
                     proximity_matches = match_against_constants(
                         est, constants, args.proximity)
 
-                    # Exact delta for proximity matches or nearby constants
+                    # Delta computation (CRT or float fallback)
                     best_delta = float('-inf')
                     best_const = None
+                    log_q = log_scale + (math.log(abs(q_float)) if abs(q_float) > 1e-300 else 0)
 
-                    if proximity_matches:
-                        for m in proximity_matches:
-                            c = next(c for c in constants if c['name'] == m['name'])
+                    candidates = ([next(c for c in constants if c['name'] == m['name'])
+                                   for m in proximity_matches]
+                                  if proximity_matches
+                                  else [c for c in constants if abs(est - c['value_float']) < 1.0])
+
+                    for c in candidates:
+                        if crt_ok:
                             delta = compute_delta_against_constant(
                                 p_big, q_big, c['value'], args.dps)
-                            if delta > best_delta:
-                                best_delta = delta
-                                best_const = c['name']
-                    else:
-                        for c in constants:
-                            if abs(est - c['value_float']) < 1.0:
-                                delta = compute_delta_against_constant(
-                                    p_big, q_big, c['value'], args.dps)
-                                if delta > best_delta:
-                                    best_delta = delta
-                                    best_const = c['name']
+                        else:
+                            try:
+                                err = abs(est - c['value_float'])
+                                delta = (-(1.0 + math.log(err) / log_q)
+                                         if err > 0 and log_q > 0 else float('-inf'))
+                            except Exception:
+                                delta = float('-inf')
+                        if delta > best_delta:
+                            best_delta = delta
+                            best_const = c['name']
 
                     is_hit = best_delta > 0 or len(proximity_matches) > 0
                     if is_hit:

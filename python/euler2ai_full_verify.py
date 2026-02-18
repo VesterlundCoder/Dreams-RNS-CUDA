@@ -73,6 +73,44 @@ def compute_delta(p_big, q_big, target_mp, dps=200):
         return float('-inf')
 
 
+def compute_delta_float(est, target_float, log_scale, q_float):
+    """Compute delta from float shadow when CRT overflows.
+
+    Uses the float64 estimate and accumulated log-scale to approximate
+    delta without exact big-integer CRT reconstruction.
+
+    Good to ~15 decimal digits of precision in the convergent ratio.
+    """
+    try:
+        err = abs(est - target_float)
+        if err == 0:
+            return float('inf')
+        log_err = math.log(err)
+        log_q = log_scale + math.log(abs(q_float)) if abs(q_float) > 1e-300 else log_scale
+        if log_q <= 0:
+            return float('-inf')
+        return -(1.0 + log_err / log_q)
+    except Exception:
+        return float('-inf')
+
+
+def crt_overflowed(p_big, q_big, est_float):
+    """Detect CRT overflow by comparing CRT ratio with float shadow."""
+    if q_big == 0:
+        return True
+    try:
+        crt_ratio = float(p_big) / float(q_big)
+        if not math.isfinite(crt_ratio) or not math.isfinite(est_float):
+            return True
+        # If CRT ratio disagrees with float estimate by more than 1%, CRT overflowed
+        if abs(est_float) > 1e-10:
+            return abs(crt_ratio - est_float) / abs(est_float) > 0.01
+        else:
+            return abs(crt_ratio - est_float) > 0.01
+    except Exception:
+        return True
+
+
 def load_cmf_pcfs(path: str):
     """Load cmf_pcfs.json (JSONL or single-array JSON)."""
     records = []
@@ -198,11 +236,24 @@ def main():
                 est = (res['p_float'] / res['q_float']
                        if abs(res['q_float']) > 1e-300 else float('nan'))
 
-                # Compute delta against stated limit
+                # Detect CRT overflow and choose delta method
+                overflow = crt_overflowed(p_big, q_big, est)
+
                 if target_mp is not None:
-                    delta_cuda = compute_delta(p_big, q_big, target_mp, args.dps)
+                    if overflow:
+                        # CRT overflowed — use float shadow delta
+                        delta_cuda = compute_delta_float(
+                            est, float(target_mp),
+                            res.get('log_scale', 0.0),
+                            res['q_float'])
+                        delta_method = 'float'
+                    else:
+                        # CRT valid — use exact mpmath delta
+                        delta_cuda = compute_delta(p_big, q_big, target_mp, args.dps)
+                        delta_method = 'crt'
                 else:
                     delta_cuda = float('nan')
+                    delta_method = 'none'
 
                 p_bits = Mp.bit_length()
                 elapsed = time.time() - t0
@@ -253,16 +304,10 @@ def main():
                 status = "MATCH" if is_match else "MISS"
                 delta_show = f"{delta_cuda:.5f}" if math.isfinite(delta_cuda) else str(delta_cuda)
                 ref_show = f"{delta_ref:.5f}" if delta_ref is not None else "N/A"
-                # Show convergence class
-                if delta_ref is not None and delta_ref < -0.5:
-                    conv_class = "slow"
-                elif delta_ref is not None and delta_ref < 0:
-                    conv_class = "med"
-                else:
-                    conv_class = "fast"
+                method_tag = f"[{delta_method}]"
                 print(f"  [{pi+1:>5}/{len(records)}] {status} "
                       f"δ_cuda={delta_show:>10} δ_ref={ref_show:>10} "
-                      f"diff={diff:.6f} [{conv_class}] est={est:.8f} "
+                      f"diff={diff:.6f} {method_tag} est={est:.8f} "
                       f"({elapsed:.1f}s) {len(sources)}src a={a_str[:40]}")
 
             except Exception as e:
