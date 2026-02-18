@@ -252,13 +252,21 @@ class CmfCompiler:
             if exp == -1:
                 r = self.compile_sympy_expr(base, axis_symbols)
                 return self.inv(r)
-            # General power: expand to multiplications
+            # General positive power: expand to multiplications
             if isinstance(exp, (int, sp.Integer)) and int(exp) > 0:
                 r = self.compile_sympy_expr(base, axis_symbols)
                 result = r
                 for _ in range(int(exp) - 1):
                     result = self.mul(result, r)
                 return result
+            # Negative integer power: compute base^|exp| then INV
+            if isinstance(exp, (int, sp.Integer)) and int(exp) < -1:
+                pos_exp = -int(exp)
+                r = self.compile_sympy_expr(base, axis_symbols)
+                result = r
+                for _ in range(pos_exp - 1):
+                    result = self.mul(result, r)
+                return self.inv(result)
             raise ValueError(f"Unsupported power: {expr}")
         
         if isinstance(expr, sp.Rational):

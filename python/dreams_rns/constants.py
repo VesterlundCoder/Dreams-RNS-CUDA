@@ -19,6 +19,12 @@ CONSTANTS_REGISTRY = [
     {"name": "zeta5",   "sympy_expr": "zeta(5)",   "description": "ζ(5)"},
     {"name": "zeta7",   "sympy_expr": "zeta(7)",   "description": "ζ(7)"},
     {"name": "zeta9",   "sympy_expr": "zeta(9)",   "description": "ζ(9)"},
+    {"name": "zeta11",  "sympy_expr": "zeta(11)",  "description": "ζ(11)"},
+    {"name": "zeta13",  "sympy_expr": "zeta(13)",  "description": "ζ(13)"},
+    {"name": "zeta15",  "sympy_expr": "zeta(15)",  "description": "ζ(15)"},
+    {"name": "zeta17",  "sympy_expr": "zeta(17)",  "description": "ζ(17)"},
+    {"name": "zeta19",  "sympy_expr": "zeta(19)",  "description": "ζ(19)"},
+    {"name": "zeta21",  "sympy_expr": "zeta(21)",  "description": "ζ(21)"},
 
     # Pi variants
     {"name": "pi",      "sympy_expr": "pi",        "description": "π"},
