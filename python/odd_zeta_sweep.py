@@ -44,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dreams_rns.compiler import compile_cmf_from_dict
 from dreams_rns.cmf_walk import run_cmf_walk_vec
-from dreams_rns.constants import load_constants
+from dreams_rns.constants import load_constants, compute_match_digits
 
 import sympy as sp
 import mpmath as mp
@@ -499,23 +499,9 @@ def main():
                         if not math.isfinite(est):
                             continue
 
-                        # Match against all constants
-                        best_const = "none"
-                        best_digits = -1.0
-
-                        for c in constants:
-                            err = abs(est - c['value_float'])
-                            if err == 0:
-                                digits = 16.0
-                            elif err > 0 and c['value_float'] != 0:
-                                digits = -math.log10(
-                                    err / max(abs(c['value_float']), 1e-300))
-                            else:
-                                digits = 0.0
-                            if digits > best_digits:
-                                best_digits = digits
-                                best_const = c['name']
-                        best_digits = max(best_digits, 0.0)
+                        # Match against all constants (ratio-aware near 1.0)
+                        best_const, best_digits = compute_match_digits(
+                            est, constants)
 
                         # Float delta (secondary)
                         log_q = res['log_scale'] + (
